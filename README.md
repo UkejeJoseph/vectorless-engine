@@ -1,5 +1,3 @@
-> **Maintained by [Joseph Ukeje](https://github.com/UkejeJoseph)**
-
 <p align="center">
   <img src="docs/media/banner.png" alt="Vectorless: a retrieval engine with no vectors, citations that land on the exact line of the PDF" width="100%"/>
 </p>
