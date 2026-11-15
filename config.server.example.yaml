@@ -1,0 +1,158 @@
+# Vectorless Server — example configuration.
+#
+# Every value below has a sensible default. Override with env vars
+# (VLS_* for server, VLE_* for engine) or edit this file.
+#
+# Precedence: env vars > YAML file > built-in defaults.
+
+# ── Server ─────────────────────────────────────────────────────────
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 120s
+  drain_timeout: 15s
+
+  # Direct TLS (optional). Leave empty to terminate TLS at your proxy.
+  tls:
+    cert_file: ""
+    key_file: ""
+    min_version: "1.2"   # "1.2" or "1.3"
+
+# ── Authentication ─────────────────────────────────────────────────
+auth:
+  # "none" — all requests are anonymous (default, for local dev).
+  # "api_key" — require Authorization: Bearer <key>.
+  mode: "none"
+  api_key: ""   # set via VLS_AUTH_API_KEY in production
+
+# ── Prometheus Metrics ─────────────────────────────────────────────
+metrics:
+  enabled: true   # serves /metrics endpoint
+
+# ── OpenTelemetry Tracing ──────────────────────────────────────────
+tracing:
+  enabled: false
+  endpoint: "localhost:4317"   # OTLP gRPC collector
+  insecure: true               # disable TLS for local dev
+  service_name: "vectorless-server"
+  sample_rate: 1.0             # 0.0–1.0; 1.0 = sample everything
+
+# ── Rate Limiting ──────────────────────────────────────────────────
+rate_limit:
+  enabled: false
+  requests_per_minute: 600
+
+# ── Engine Configuration ───────────────────────────────────────────
+# Everything below is passed through to the vectorless engine.
+engine:
+  database:
+    url: "postgres://vectorless:vectorless@localhost:5432/vectorless?sslmode=disable"
+    max_conns: 10
+
+  storage:
+    driver: "local"   # "local" or "s3"
+    local:
+      root: "./data/documents"
+    # s3:
+    #   endpoint: "http://localhost:9000"
+    #   region: "us-east-1"
+    #   bucket: "vectorless"
+    #   access_key: "minioadmin"
+    #   secret_key: "minioadmin"
+    #   use_path_style: true
+
+  queue:
+    driver: "river"   # "river", "qstash", or "asynq"
+    river:
+      num_workers: 10
+    # qstash:
+    #   token: ""
+    #   webhook_base_url: "https://your-server.com"
+    #   current_signing_key: ""
+    #   next_signing_key: ""
+    # asynq:
+    #   addr: "localhost:6379"
+    #   password: ""
+    #   db: 0
+    #   concurrency: 20
+
+  llm:
+    driver: "anthropic"   # "anthropic", "openai", "gemini" or "vertex"
+    anthropic:
+      api_key: ""   # set via VLS_ANTHROPIC_API_KEY
+      model: "claude-sonnet-4-20250514"
+      reasoning_model: ""
+    # openai:
+    #   api_key: ""
+    #   model: "gpt-4o"
+    #   reasoning_model: ""
+    # gemini:
+    #   api_key: ""
+    #   model: "gemini-2.0-flash"
+    # vertex:                     # Gemini on Vertex AI: no key, ADC bills the project
+    #   project: ""               # VLS_LLM_VERTEX_PROJECT (or GOOGLE_CLOUD_PROJECT)
+    #   location: "global"        # VLS_LLM_VERTEX_LOCATION
+    #   model: "gemini-2.5-flash-lite"
+    #   thinking_budget: 0        # VLS_LLM_VERTEX_THINKING_BUDGET; omit for the model default
+    #   reasoning_model: ""
+    # Adaptive per-provider concurrency (HAL-1372): starts at initial,
+    # halves on 429/transport failure, widens on success, capped at max.
+    concurrency:
+      initial: 4
+      max: 64
+    # Judge (TypeSafe Jev): batched contents-page detection and page
+    # resolution during ingest. Enabled when api_key is set — also read
+    # from VLE_TYPESAFE_API_KEY / TYPESAFE_API_KEY. See HAL-1367.
+    judge:
+      typesafe:
+        api_key: ""
+      # threshold: 0.5
+
+  retrieval:
+    strategy: "chunked-tree"   # "single-pass" or "chunked-tree"
+    chunked_tree:
+      max_tokens_per_call: 60000
+      max_parallel_calls: 8
+      include_sibling_breadcrumbs: true
+
+  ingest:
+    # Ingest mode: full (default) | minimal.
+    #   full     parse -> persist -> summarize -> HyDE -> multi-axis ->
+    #            TOC build. Maximum retrieval quality; minutes on a large
+    #            filing.
+    #   minimal  parse -> persist -> ready. Skips every LLM enrichment
+    #            stage AND table extraction — queryable in seconds. The
+    #            page-based strategy (/v1/answer/treewalk) works on it
+    #            unchanged (synthesised TOC + raw page reads).
+    # Flip the live service without a secret edit: VLS_INGEST_MODE=minimal.
+    mode: "full"
+
+    # The summarize and HyDE stages run concurrently. This caps the total
+    # number of LLM calls in flight across both stages combined.
+    # 0 disables the global cap; default is 12.
+    # (Ignored when mode: minimal — no LLM stages run.)
+    global_llm_concurrency: 12
+
+    # HyDE candidate-question generation per leaf section. Folded into
+    # the retrieval prompt at query time to widen recall on queries that
+    # don't echo the section's exact wording.
+    hyde:
+      enabled: true
+      model: ""             # empty => same model as summarization
+      num_questions: 5
+      concurrency: 4
+
+    # Multi-axis structured summaries (Phase 2.5). JSON-mode summarizer
+    # returns {topics, entities, numbers, one_line}. The retrieval
+    # prompt surfaces entities + numbers on the section line; the
+    # one_line continues to populate the flat `summary` field for
+    # backward compatibility.
+    summary_axes:
+      enabled: true
+      max_topics: 4
+      max_entities: 8
+      max_numbers: 6
+
+  log:
+    level: "info"     # "debug", "info", "warn", "error"
+    format: "json"    # "json" or "console"
