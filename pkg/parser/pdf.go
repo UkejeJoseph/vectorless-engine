@@ -1,0 +1,2043 @@
+package parser
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/hallelx2/pdftable"
+	pdflib "github.com/ledongthuc/pdf"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+)
+
+// PDF is a pragmatic first-pass PDF parser.
+//
+// PDF is a layout format, not a structured format — there are no real
+// headings in the wire layer, just runs of glyphs with font sizes and
+// positions. To recover structure we:
+//
+//  1. Extract positioned WORDS per page (font name + size + bbox) using
+//     pdftable's content-stream interpreter.
+//  2. Compute the median font size across the whole document.
+//  3. Treat any row whose font size exceeds a threshold (1.2× median)
+//     AND that is short (<= 14 words) as a heading candidate.
+//  4. Group headings into levels by font-size buckets (largest = level 1).
+//  5. Everything else is body text for the most recent heading.
+//  6. Run pdftable's table-finding pipeline over each page and emit one
+//     extra Section per detected table whose Content is a GitHub-flavoured
+//     Markdown rendering of the cells. Tables are flagged with
+//     Metadata["table"]="true" so retrieval can lean on numeric content
+//     that would otherwise collapse into a space-joined run.
+//
+// Encrypted PDFs are auto-decrypted with the empty password via pdfcpu.
+// PDFs with non-standard fonts and scanned PDFs (pure images) are not
+// supported at this stage.
+type PDF struct {
+	// Tables, when non-nil, overrides the default table-extraction
+	// behaviour (enabled, lines/lines strategies, minima 2×2). Pass nil
+	// to use the engine defaults; pass a zero value to disable tables
+	// entirely.
+	Tables *TableOpts
+
+	// MaxSections caps the number of leaf sections the parser emits for a
+	// single document. A pathological PDF — e.g. a 90-page filing whose
+	// every bold statement title and repeated "<Company> and
+	// Subsidiaries" line trips the heading detector, leaving a swarm of
+	// empty/tiny heading-only leaves — can otherwise produce far more
+	// leaves than the document has real sections. Each leaf later costs a
+	// summarize + HyDE LLM call, so an uncapped count directly throttles
+	// or stalls ingest.
+	//
+	// When the prose leaf count exceeds MaxSections, adjacent small leaf
+	// siblings under a shared parent are merged (smallest first) until the
+	// count is back under the cap. Table sections (which carry distinct
+	// numeric content) are never merged.
+	//
+	// Zero selects defaultMaxLeafSections. A negative value disables the
+	// cap entirely (escape hatch for callers that want the raw outline).
+	MaxSections int
+
+	// ParseTimeout bounds the ENTIRE Parse of one document — row
+	// extraction, table extraction, section building, and the leaf cap,
+	// end to end. It is the outermost robustness valve.
+	//
+	// Every other time bound inside the parser caps a sub-stage
+	// (tableExtractPageTimeout / tableExtractDocBudget cap table
+	// extraction), but the pure-Go row extractor
+	// (extractPDFRows -> reader.Page(n).Content()) had no bound at all —
+	// and that is exactly where a pathological PDF was observed hanging
+	// 600s+ in `parsing`, even in minimal mode (pre-LLM). ParseTimeout
+	// runs the whole parse on a goroutine and abandons it on deadline,
+	// returning a clear error so ingest fails the document fast instead
+	// of wedging forever.
+	//
+	// Nothing is disabled by this bound: when the parse finishes inside
+	// the deadline the full feature set (tables, the outline/heuristic
+	// section tree, the cap) is produced exactly as before.
+	//
+	// Zero selects defaultParseTimeout (120s). A non-positive value other
+	// than zero (i.e. negative) disables the bound entirely — Parse then
+	// runs synchronously with no deadline (escape hatch / legacy
+	// behaviour for callers that want an unbounded parse).
+	ParseTimeout time.Duration
+}
+
+// TableOpts controls pdftable's table-finding stage. The zero value
+// disables table extraction; use DefaultTableOpts() for the
+// production-default knobs.
+type TableOpts struct {
+	// Enabled toggles table extraction. When false, the parser behaves
+	// exactly like the pre-integration text-only flow.
+	Enabled bool
+
+	// VerticalStrategy is forwarded to pdftable as
+	// TableSettings.VerticalStrategy. Empty falls back to "lines".
+	VerticalStrategy string
+
+	// HorizontalStrategy is forwarded to pdftable as
+	// TableSettings.HorizontalStrategy. Empty falls back to "lines".
+	HorizontalStrategy string
+
+	// MinTableRows is the minimum row count for a candidate table to be
+	// emitted as a Section. 0 means "no minimum"; recommend 2 in
+	// production so trivial single-row matches don't leak into the
+	// outline.
+	MinTableRows int
+
+	// MinTableCols is the minimum column count for a candidate table.
+	// Same semantics as MinTableRows.
+	MinTableCols int
+}
+
+// DefaultTableOpts returns the production defaults: tables on, both axes
+// using the "lines" strategy, minima 2×2. These mirror pdftable's own
+// DefaultTableSettings() and were tuned against the FinanceBench 10-K
+// fixtures.
+func DefaultTableOpts() *TableOpts {
+	return &TableOpts{
+		Enabled:            true,
+		VerticalStrategy:   "lines",
+		HorizontalStrategy: "lines",
+		MinTableRows:       2,
+		MinTableCols:       2,
+	}
+}
+
+// NewPDF returns a new PDF parser with table extraction enabled at the
+// production defaults and the default leaf-section cap. Pass
+// NewPDFWithTables(nil) (or a zero TableOpts) to opt out of tables.
+func NewPDF() *PDF { return &PDF{Tables: DefaultTableOpts()} }
+
+// NewPDFWithTables returns a PDF parser using the supplied table-
+// extraction options and the default leaf-section cap. Pass nil to
+// disable table extraction.
+func NewPDFWithTables(opts *TableOpts) *PDF { return &PDF{Tables: opts} }
+
+// NewPDFWithOpts returns a PDF parser using the supplied table-extraction
+// options and an explicit leaf-section cap. maxSections == 0 selects
+// defaultMaxLeafSections; a negative value disables the cap. The parse
+// timeout is left at its zero value, which resolves to defaultParseTimeout.
+func NewPDFWithOpts(opts *TableOpts, maxSections int) *PDF {
+	return &PDF{Tables: opts, MaxSections: maxSections}
+}
+
+// NewPDFWithConfig returns a PDF parser with the table options, leaf-
+// section cap, AND total-parse timeout all set explicitly. This is the
+// constructor the engine wiring uses so every parser robustness knob is
+// operator-tunable via config (ingest.max_sections,
+// ingest.parse_timeout_seconds).
+//
+//   - maxSections == 0  → defaultMaxLeafSections; negative disables the cap.
+//   - parseTimeout == 0 → defaultParseTimeout; negative disables the bound.
+func NewPDFWithConfig(opts *TableOpts, maxSections int, parseTimeout time.Duration) *PDF {
+	return &PDF{Tables: opts, MaxSections: maxSections, ParseTimeout: parseTimeout}
+}
+
+// Name implements Parser.
+func (*PDF) Name() string { return "pdf" }
+
+// Accepts implements Parser.
+func (*PDF) Accepts(contentType, filename string) bool {
+	if contentType == "application/pdf" {
+		return true
+	}
+	return HasExt(filename, ".pdf")
+}
+
+// Parse implements Parser.
+//
+// Parse is a thin timeout wrapper around the real parse work (parseDoc).
+// It bounds the WHOLE parse — row extraction, table extraction, section
+// building, and the leaf cap — by p.resolvedParseTimeout(). The work runs
+// on a goroutine; if it doesn't finish by the deadline (or ctx is
+// cancelled) Parse returns a clear error and abandons the goroutine. The
+// goroutine then finishes on its own (or is GC'd) — its result lands in a
+// buffered channel so it never blocks on send. This is the same
+// abandon-on-deadline pattern safeExtractTables already uses for a single
+// table page, lifted to cover the entire parse so ANY parse pathology
+// (notably the unbounded pure-Go ledongthuc row extractor) fails fast and
+// cleanly instead of hanging ingest forever.
+//
+// A negative ParseTimeout disables the bound and runs parseDoc inline.
+func (p *PDF) Parse(ctx context.Context, r io.Reader) (*ParsedDoc, error) {
+	// Read the bytes up front (outside the deadline goroutine): io.ReadAll
+	// is bounded by the reader/storage layer, not by the PDF pathology we
+	// are guarding against, and reading here keeps the goroutine body a
+	// pure CPU/parse unit.
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return runParseWithDeadline(ctx, p.resolvedParseTimeout(), func() (*ParsedDoc, error) {
+		return p.parseDoc(ctx, buf)
+	})
+}
+
+// runParseWithDeadline runs work bounded by timeout. It is the reusable
+// core of the whole-Parse robustness valve, factored out so the
+// deadline/abandon mechanism is unit-testable with an arbitrary work
+// closure (e.g. one that sleeps past the deadline) without needing a
+// pathological real PDF.
+//
+//   - timeout <= 0 runs work inline with NO bound (legacy/unbounded
+//     behaviour; the explicit escape hatch a negative ParseTimeout selects).
+//   - Otherwise work runs on a goroutine and the function selects on the
+//     work result, a time.After(timeout), and ctx cancellation. On
+//     timeout/cancel the goroutine is abandoned: its result lands in a
+//     buffered channel so it can always send and exit (no leak on send),
+//     then runs to completion on its own and is collected. A panic inside
+//     work is recovered and surfaced as an error so a backend bug can
+//     never crash the ingest worker.
+//
+// The timeout/cancel errors are deliberately phrased so the ingest
+// pipeline's existing "parse failed → document failed" path produces a
+// clear, ops-visible message instead of an infinite hang.
+func runParseWithDeadline(ctx context.Context, timeout time.Duration, work func() (*ParsedDoc, error)) (*ParsedDoc, error) {
+	if timeout <= 0 {
+		return work()
+	}
+
+	type result struct {
+		doc *ParsedDoc
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				done <- result{err: fmt.Errorf("pdf: parse panicked: %v", rec)}
+			}
+		}()
+		doc, perr := work()
+		done <- result{doc: doc, err: perr}
+	}()
+
+	select {
+	case res := <-done:
+		return res.doc, res.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("pdf: parse exceeded %s — document too complex or malformed", timeout)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("pdf: parse cancelled: %w", ctx.Err())
+	}
+}
+
+// pdftableOpenMu serializes pdftable.OpenBytes. pdftable mutates package-level
+// state while opening a document and is not safe for concurrent callers — the
+// race detector flags concurrent OpenBytes calls, and this is real in
+// production because ingest workers parse documents in parallel. Serializing
+// just the open (the only racing call) keeps correctness at a small cost.
+// Stopgap: the proper fix is to make pdftable itself concurrency-safe
+// (tracked in the Foundational Libraries project).
+var pdftableOpenMu sync.Mutex
+
+// openPDFBytes is the concurrency-safe wrapper around pdftable.OpenBytes.
+func openPDFBytes(b []byte) (pdftable.Document, error) {
+	pdftableOpenMu.Lock()
+	defer pdftableOpenMu.Unlock()
+	return pdftable.OpenBytes(b)
+}
+
+// parseDoc is the real parse implementation. It is bounded by Parse's
+// deadline wrapper; on its own it has no time bound beyond the per-stage
+// table-extraction budgets.
+func (p *PDF) parseDoc(_ context.Context, buf []byte) (*ParsedDoc, error) {
+
+	// We run TWO PDF backends in parallel here:
+	//
+	//   - pdftable (the new primitive layer) extracts positioned WORDS
+	//     (font name + size + bbox) directly. This is the input to the
+	//     section-discovery heuristics and is also the only source for
+	//     the table-finding pass. It is robust to letter-spaced glyphs
+	//     and ships pdfplumber-parity word grouping out of the box.
+	//
+	//   - ledongthuc/pdf is retained solely for /Outlines (bookmark)
+	//     access — pdftable does not expose the outline dictionary yet,
+	//     and outlines are ground truth for SEC filings / academic papers
+	//     that have one. Once pdftable surfaces outlines we can drop the
+	//     dependency entirely.
+	//
+	// Both backends consume the same byte slice. If pdftable rejects the
+	// document as encrypted we strip the encryption layer with pdfcpu
+	// (empty password) and retry — this is the path that lets us index
+	// "owner-password" PDFs whose only restriction is print/copy.
+	docBytes := buf
+	pdoc, err := openPDFBytes(docBytes)
+	if err != nil {
+		if isPdftableEncryptedErr(err) {
+			cleaned, decErr := decryptPDFWithEmptyPassword(buf)
+			if decErr != nil {
+				return nil, fmt.Errorf("pdf: open: encrypted and could not be unlocked with empty password: %w", decErr)
+			}
+			docBytes = cleaned
+			pdoc, err = openPDFBytes(docBytes)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("pdf: open: %w", err)
+		}
+	}
+	defer func() { _ = pdoc.Close() }() // best-effort close
+
+	// ledongthuc/pdf is now used ONLY for /Outlines (bookmarks). Text and
+	// rows come from pdftable's Words() (v0.4.0: correct order + spacing).
+	// A reader failure is therefore non-fatal — we just lose the outline
+	// hint and fall back to the font-size heuristic on the pdftable rows.
+	reader, rerr := pdflib.NewReader(bytes.NewReader(docBytes), int64(len(docBytes)))
+	if rerr != nil {
+		reader = nil
+	}
+
+	rows, err := extractPDFRows(pdoc)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("pdf: parsed but no extractable text — the document may be a scanned image (OCR not yet supported) or use a font encoding the parser can't read")
+	}
+	// Sanity check on extracted content. PDFs with overlay watermarks
+	// drawn on top of every page (the GINA-style "DO NOT COPY..." kind)
+	// can produce rows that are mostly noise — extracted text consists
+	// of doubled glyphs from the two layers being interleaved by Y.
+	// Bail with a clear message instead of going "ready" on empty data.
+	if !rowsLookLikeUsableText(rows) {
+		return nil, fmt.Errorf("pdf: text extraction produced no usable content — the document may have an overlay watermark or use a non-standard font encoding")
+	}
+
+	// Run table extraction once, BEFORE we commit to either the outline
+	// path or the heuristic path: both should be able to inherit the
+	// same set of detected tables.
+	tableSections := extractPDFTables(pdoc, p.Tables)
+
+	// If the PDF ships with a real outline (bookmarks), use it as ground
+	// truth for structure — beats any font-size heuristic. We still rely
+	// on row extraction for section bodies by matching outline titles
+	// against the first occurrence of that text in the row stream.
+	if reader != nil {
+		if outline := reader.Outline(); len(outline.Child) > 0 {
+			if doc, ok := parsePDFWithOutline(outline, rows); ok {
+				doc.Sections = capLeafSections(doc.Sections, p.resolvedMaxSections())
+				doc.Pages = pagesFromRows(rows)
+				attachTableSections(doc, tableSections)
+				return doc, nil
+			}
+		}
+	}
+
+	// Median font size — our reference for "normal body text".
+	sizes := make([]float64, 0, len(rows))
+	for _, r := range rows {
+		if r.fontSize > 0 {
+			sizes = append(sizes, r.fontSize)
+		}
+	}
+	sort.Float64s(sizes)
+	median := 0.0
+	if n := len(sizes); n > 0 {
+		median = sizes[n/2]
+	}
+	headingFloor := median * 1.2
+
+	// Unique heading sizes, largest first. These define heading levels:
+	// the largest bucket is level 1, next is level 2, etc. (capped at 6).
+	levelForSize := buildHeadingLevelMap(rows, headingFloor)
+
+	// Bold rows at (at least) body size are headings too. Filings bold their
+	// section headers rather than enlarging them, so a size-only heuristic
+	// collapses the whole body into one block. Bold-derived headings nest one
+	// level below the smallest font-derived heading level.
+	boldLevel := 1
+	for _, lv := range levelForSize {
+		if lv+1 > boldLevel {
+			boldLevel = lv + 1
+		}
+	}
+	if boldLevel > 6 {
+		boldLevel = 6
+	}
+
+	type flat struct {
+		level     int
+		title     string
+		body      strings.Builder
+		pageStart int // min source page touched by this flat (0 = none seen yet)
+		pageEnd   int // max source page touched by this flat
+	}
+	flats := []*flat{{level: 0, title: ""}}
+	current := flats[0]
+
+	// touch records that this flat consumed a row from the given page,
+	// expanding pageStart/pageEnd. Pages on rows that aren't body text
+	// (e.g. a heading row itself) are also counted: the heading lives on
+	// that page, so the section visibly starts there.
+	touch := func(f *flat, page int) {
+		if page <= 0 {
+			return
+		}
+		if f.pageStart == 0 || page < f.pageStart {
+			f.pageStart = page
+		}
+		if page > f.pageEnd {
+			f.pageEnd = page
+		}
+	}
+
+	for _, row := range rows {
+		text := strings.TrimSpace(row.text)
+		if text == "" {
+			continue
+		}
+		lvl, isHeading := levelForSize[roundSize(row.fontSize)]
+		if !isHeading && row.bold && row.fontSize >= median && looksLikeHeading(text) {
+			isHeading = true
+			lvl = boldLevel
+		}
+		if isHeading && looksLikeHeading(text) {
+			// A *sub-numbered* prefix ("3.1", "3.1.2") signals extra nesting
+			// depth relative to the font-derived level. We only ever DEEPEN
+			// (never change the base level), so top-level headings — numbered
+			// "3" or not ("Abstract") — stay siblings at the same font level.
+			newLevel := lvl
+			if nd, ok := numberedHeadingDepth(text); ok && nd > 1 {
+				newLevel += nd - 1
+			}
+			// Multi-line display heading: a run of heading rows at the SAME
+			// level, on the SAME page, with NO body text accrued between them
+			// is one visual heading wrapped across lines — e.g. a hero title
+			// "THE SYSTEM, END-TO-END" / "How Vectorless" / "actually works."
+			// Left un-merged, each line becomes its own heading flat whose
+			// body is empty, shipping as a "purely structural" Section that
+			// returns empty content to the section browser / API. Fold the
+			// continuation line into the current heading instead so the body
+			// that follows attaches to the whole title and no empty fragment
+			// section is emitted. We only merge when the current flat is
+			// itself an as-yet-empty heading at the same level on the same
+			// page — never across a level change (real nesting) or once body
+			// text has begun.
+			if current.level > 0 && newLevel == current.level &&
+				current.title != "" &&
+				strings.TrimSpace(current.body.String()) == "" &&
+				(current.pageEnd == 0 || row.page == 0 || row.page == current.pageEnd) {
+				current.title = strings.TrimSpace(current.title + " " + text)
+				touch(current, row.page)
+				continue
+			}
+			current = &flat{level: newLevel, title: text}
+			touch(current, row.page)
+			flats = append(flats, current)
+			continue
+		}
+		if current.body.Len() > 0 {
+			current.body.WriteString(" ")
+		}
+		current.body.WriteString(text)
+		touch(current, row.page)
+	}
+
+	if len(flats) > 1 && flats[0].level == 0 && strings.TrimSpace(flats[0].body.String()) == "" {
+		flats = flats[1:]
+	}
+
+	var title string
+	for _, f := range flats {
+		if f.level == 1 {
+			title = f.title
+			break
+		}
+	}
+	if title == "" && len(flats) > 0 {
+		title = flats[0].title
+	}
+
+	// Build hierarchy via level stack.
+	rootSec := &Section{Level: 0, Title: title}
+	stack := []*Section{rootSec}
+	for _, f := range flats {
+		sec := Section{
+			Level:     f.level,
+			Title:     f.title,
+			Content:   strings.TrimSpace(f.body.String()),
+			PageStart: f.pageStart,
+			PageEnd:   f.pageEnd,
+		}
+		if f.level == 0 {
+			if sec.Content == "" {
+				continue
+			}
+			sec.Level = 1
+			sec.Title = "Introduction"
+		}
+		for len(stack) > 1 && stack[len(stack)-1].Level >= sec.Level {
+			stack = stack[:len(stack)-1]
+		}
+		parent := stack[len(stack)-1]
+		parent.Children = append(parent.Children, sec)
+		tail := &parent.Children[len(parent.Children)-1]
+		stack = append(stack, tail)
+	}
+
+	// No headings recovered? Fall back to one "Document" section spanning
+	// every page we saw.
+	if len(rootSec.Children) == 0 {
+		var all strings.Builder
+		minPage, maxPage := 0, 0
+		for _, f := range flats {
+			if s := strings.TrimSpace(f.body.String()); s != "" {
+				if all.Len() > 0 {
+					all.WriteString(" ")
+				}
+				all.WriteString(s)
+			}
+			if f.pageStart > 0 && (minPage == 0 || f.pageStart < minPage) {
+				minPage = f.pageStart
+			}
+			if f.pageEnd > maxPage {
+				maxPage = f.pageEnd
+			}
+		}
+		rootSec.Children = []Section{{
+			Level:     1,
+			Title:     "Document",
+			Content:   all.String(),
+			PageStart: minPage,
+			PageEnd:   maxPage,
+		}}
+	}
+
+	// Drop empty "structural" leaf fragments (multi-line title remnants,
+	// running headers) so no section returns empty content to the browser /
+	// API; their titles ride onto the sibling body they head.
+	rootSec.Children = foldEmptyLeafSections(rootSec.Children)
+
+	// Internal sections inherit the union of their children's page ranges
+	// so callers reading the outline can still cite a page span.
+	propagateSectionPages(rootSec.Children)
+
+	out := &ParsedDoc{
+		Title:    title,
+		Sections: capLeafSections(chunkOversizedLeaves(rootSec.Children), p.resolvedMaxSections()),
+		Pages:    pagesFromRows(rows),
+	}
+	attachTableSections(out, tableSections)
+	return out, nil
+}
+
+// pagesFromRows groups the filtered rows by page, in order. Rows carry
+// the physical page index they were read from, so a page with no rows
+// (blank, or image-only) simply has no entry — its number is still
+// its own, never reassigned.
+func pagesFromRows(rows []pdfRow) []Page {
+	var out []Page
+	var cur *Page
+	for _, r := range rows {
+		text := strings.TrimSpace(r.text)
+		if text == "" || r.page <= 0 {
+			continue
+		}
+		if cur == nil || cur.Number != r.page {
+			out = append(out, Page{Number: r.page})
+			cur = &out[len(out)-1]
+		}
+		if cur.Text != "" {
+			cur.Text += "\n"
+		}
+		cur.Text += text
+	}
+	return out
+}
+
+// resolvedMaxSections turns the configured MaxSections into the value
+// the cap actually uses: 0 selects defaultMaxLeafSections; a negative
+// value disables the cap (returns a non-positive number capLeafSections
+// treats as "off").
+func (p *PDF) resolvedMaxSections() int {
+	if p.MaxSections == 0 {
+		return defaultMaxLeafSections
+	}
+	return p.MaxSections
+}
+
+// defaultParseTimeout is the whole-Parse deadline applied when
+// ParseTimeout is left at its zero value. 120s is comfortably longer than
+// a healthy 300-page filing's parse (seconds to low tens of seconds) yet
+// short enough that a pathological/malformed document — the kind observed
+// hanging 600s+ in pure-Go row extraction — is reaped quickly and the
+// document fails fast instead of wedging ingest.
+const defaultParseTimeout = 120 * time.Second
+
+// resolvedParseTimeout turns the configured ParseTimeout into the value
+// the wrapper actually uses: 0 selects defaultParseTimeout; a negative
+// value disables the bound (Parse runs parseDoc inline with no deadline).
+func (p *PDF) resolvedParseTimeout() time.Duration {
+	if p.ParseTimeout == 0 {
+		return defaultParseTimeout
+	}
+	return p.ParseTimeout
+}
+
+// foldEmptyLeafSections eliminates leaf sections (no children) whose
+// content is empty. A PDF whose heading detector fires on a fragment that
+// carries no body — a lone display-title line the row-merge didn't catch,
+// a repeated running header, a stray bold word — otherwise ships as a
+// "purely structural" Section that returns empty content to the section
+// browser and the /v1/sections/{id} API, which reads as a broken/empty
+// part of the document.
+//
+// The fold is lossless: an empty leaf's TITLE is preserved by attaching it
+// as a bold markdown heading line to the content of the sibling it heads —
+// the NEXT sibling when one exists (the body it introduces), else the
+// PREVIOUS sibling. Consecutive empty leaves accumulate and flush together
+// into the first sibling that can carry them, so a multi-line title that
+// escaped the row-merge still lands as one heading block above its body.
+// Page ranges union so citations stay correct. Internal nodes (sections
+// WITH children) are recursed into but never dropped — an empty heading
+// with real sub-sections is legitimate structure whose content lives in
+// its children.
+//
+// A lone empty leaf with no siblings to carry its title is kept as-is
+// (dropping it would erase the only trace of that heading); this is the
+// rare degenerate case and harms nothing.
+func foldEmptyLeafSections(sections []Section) []Section {
+	for i := range sections {
+		if len(sections[i].Children) > 0 {
+			sections[i].Children = foldEmptyLeafSections(sections[i].Children)
+		}
+	}
+
+	// Collect the indices of empty leaves eligible to fold. A section is an
+	// empty leaf when it has no children and no non-whitespace content.
+	emptyLeaf := func(s *Section) bool {
+		return len(s.Children) == 0 && strings.TrimSpace(s.Content) == ""
+	}
+	// Nothing to do unless there is at least one empty leaf AND at least one
+	// sibling that can carry a folded title.
+	empties, carriers := 0, 0
+	for i := range sections {
+		if emptyLeaf(&sections[i]) {
+			empties++
+		} else {
+			carriers++
+		}
+	}
+	if empties == 0 || carriers == 0 {
+		return sections
+	}
+
+	out := make([]Section, 0, len(sections))
+	var pendingTitles []string
+	var pendStart, pendEnd int
+	takePending := func(target *Section) {
+		if len(pendingTitles) == 0 {
+			return
+		}
+		var b strings.Builder
+		for _, t := range pendingTitles {
+			b.WriteString("**")
+			b.WriteString(t)
+			b.WriteString("**\n\n")
+		}
+		b.WriteString(target.Content)
+		target.Content = strings.TrimSpace(b.String())
+		target.PageStart = minNonZero(pendStart, target.PageStart)
+		if pendEnd > target.PageEnd {
+			target.PageEnd = pendEnd
+		}
+		pendingTitles = nil
+		pendStart, pendEnd = 0, 0
+	}
+
+	for i := range sections {
+		s := sections[i]
+		if emptyLeaf(&s) {
+			if t := strings.TrimSpace(s.Title); t != "" {
+				pendingTitles = append(pendingTitles, t)
+				pendStart = minNonZero(pendStart, s.PageStart)
+				if s.PageEnd > pendEnd {
+					pendEnd = s.PageEnd
+				}
+			}
+			continue // drop the empty leaf; its title rides on pendingTitles
+		}
+		// A real section: it carries any pending titles as heading prefix
+		// (these are the fragments it follows).
+		takePending(&s)
+		out = append(out, s)
+	}
+
+	// Any titles still pending had no following carrier — attach them to the
+	// last emitted sibling as a trailing heading block so nothing is lost.
+	if len(pendingTitles) > 0 && len(out) > 0 {
+		last := &out[len(out)-1]
+		var b strings.Builder
+		b.WriteString(last.Content)
+		for _, t := range pendingTitles {
+			b.WriteString("\n\n**")
+			b.WriteString(t)
+			b.WriteString("**")
+		}
+		last.Content = strings.TrimSpace(b.String())
+		if pendEnd > last.PageEnd {
+			last.PageEnd = pendEnd
+		}
+		last.PageStart = minNonZero(pendStart, last.PageStart)
+	}
+	return out
+}
+
+// propagateSectionPages fills internal-node PageStart/PageEnd from the union
+// of descendant leaf ranges where the internal node didn't have its own
+// (because its body was empty / hoisted into children). Leaves keep their
+// own range untouched.
+func propagateSectionPages(sections []Section) (minPage, maxPage int) {
+	for i := range sections {
+		s := &sections[i]
+		childMin, childMax := propagateSectionPages(s.Children)
+		// Fold the section's own range with its children's.
+		if s.PageStart > 0 && (childMin == 0 || s.PageStart < childMin) {
+			childMin = s.PageStart
+		}
+		if s.PageEnd > childMax {
+			childMax = s.PageEnd
+		}
+		// Only widen the section — never shrink a populated range to 0.
+		if childMin > 0 {
+			s.PageStart = childMin
+		}
+		if childMax > 0 {
+			s.PageEnd = childMax
+		}
+		if s.PageStart > 0 && (minPage == 0 || s.PageStart < minPage) {
+			minPage = s.PageStart
+		}
+		if s.PageEnd > maxPage {
+			maxPage = s.PageEnd
+		}
+	}
+	return minPage, maxPage
+}
+
+// Filing cover pages (and any other long, mixed-topic leaf) often produce one
+// 2-3k-char section under a generic title like "3M COMPANY", which mixes
+// registration tables, addresses, IRS IDs and contact info. A single summary
+// can't cover all those topics, so retrieval misses. Split such leaves into
+// smaller sub-sections at word boundaries; each sub-section then gets its own
+// title (from a natural colon-terminated header, e.g. "Securities registered
+// pursuant to Section 12(b) of the Act", or the first few words) and its own
+// summary downstream.
+const (
+	leafChunkThreshold = 2400 // chars; high enough to leave paper sub-sections alone
+	leafChunkTarget    = 900  // chars per chunk, give or take
+)
+
+// defaultMaxLeafSections is the ceiling NewPDF applies when MaxSections
+// is left at zero. A 92-page 10-K whose "Notes to Financial Statements"
+// section byte-splits into ~50 chunks (and whose body splits into
+// hundreds more) was observed producing ~1500 leaves — each one of
+// which then costs a summarize + HyDE + multi-axis LLM call at ingest,
+// which is what stalled the pipeline. 400 keeps a filing richly
+// structured while bounding ingest cost to something Gemini's
+// free-tier RPM can clear.
+const defaultMaxLeafSections = 400
+
+// countLeafSections returns the number of leaf sections (no children)
+// in the tree rooted at sections.
+func countLeafSections(sections []Section) int {
+	n := 0
+	for i := range sections {
+		if len(sections[i].Children) == 0 {
+			n++
+		} else {
+			n += countLeafSections(sections[i].Children)
+		}
+	}
+	return n
+}
+
+// capLeafSections enforces a ceiling on the total leaf-section count so a
+// pathological PDF can't shatter into thousands of tiny leaves (each of
+// which costs a summarize + HyDE + multi-axis LLM call at ingest, which
+// is what throttles/stalls the full pipeline). maxLeaves <= 0 disables
+// the cap; a tree already at or under the cap is returned untouched.
+//
+// The reduction is robust to ANY tree shape, which is the fix for the
+// real 10-K explosion: that document is not a flat list of adjacent
+// leaves but hundreds of SINGLE-LEAF PARENTS (heading -> one body leaf),
+// which have no adjacent leaf-sibling pairs at all — so the old
+// adjacent-only merge silently did nothing and a 92-page filing sailed
+// past the cap at 463-1465 leaves. We fix it in two phases:
+//
+//  1. collapseSingleLeafParents flattens every heading -> lone-leaf chain
+//     so the formerly-only-children become adjacent leaf SIBLINGS. This
+//     restructures the tree without changing the leaf count (the parent
+//     absorbs the child and itself becomes the leaf).
+//
+//  2. The merge loop then repeatedly merges the smallest adjacent leaf
+//     pair until the count is back under the cap (a defensive collapse
+//     step covers any pair a table leaf blocked).
+//
+// The invariant: for any tree with > maxLeaves MERGEABLE leaves,
+// capLeafSections drives countLeafSections to <= maxLeaves. The only
+// leaves it will not merge are table sections (Metadata["table"]=="true")
+// — those carry distinct numeric content and must survive verbatim. In
+// the normal parse flow table sections are attached AFTER this pass
+// (attachTableSections), so the cap never sees them; the guard is
+// defensive for any caller that pre-attaches tables.
+//
+// Merged/collapsed leaves concatenate their content (blank-line
+// separated), keep the parent/first-sibling title, and union their page
+// ranges, so no body text is ever dropped.
+func capLeafSections(sections []Section, maxLeaves int) []Section {
+	if maxLeaves <= 0 {
+		return sections
+	}
+	if countLeafSections(sections) <= maxLeaves {
+		return sections // already under the cap — leave structure untouched
+	}
+
+	// Wrap the top-level sections under a synthetic root. The merge step
+	// shrinks a sibling list in place (it rewrites parent.Children), which
+	// only propagates back to the caller when the mutated list is a struct
+	// FIELD, not a bare slice parameter. The runaway shape we're fixing —
+	// hundreds of single-leaf PARENTS — needs the TOP-level list to shrink,
+	// so we make the top level a nested list (root.Children) and operate on
+	// that; the wrapper itself (length 1) never changes. We return
+	// root.Children at the end.
+	root := []Section{{Children: sections}}
+
+	// Phase 1: flatten single-leaf-parent chains so only-children become
+	// mergeable siblings. Count is unchanged; structure is normalised.
+	root[0].Children = collapseSingleLeafParents(root[0].Children)
+
+	// Phase 2: merge adjacent leaf pairs (smallest first) until under cap.
+	// Each merge removes one leaf and each fallback collapse removes one
+	// internal node — both strictly monotonic — so the loop is bounded;
+	// the guard is belt-and-braces against a logic regression.
+	for guard := 0; countLeafSections(root) > maxLeaves && guard < 1000000; guard++ {
+		if mergeOneSmallestAdjacentLeafPair(root) {
+			continue
+		}
+		// No adjacent mergeable pair left. Try to free one up by
+		// collapsing a remaining single-leaf parent; if that's impossible
+		// too, every remaining leaf is unmergeable (e.g. table sections)
+		// and we stop — there is nothing left we're permitted to merge.
+		if !collapseOneSingleLeafParent(&root) {
+			break
+		}
+	}
+	return root[0].Children
+}
+
+// isTableLeaf reports whether s is a table section that must never be
+// merged or collapsed (its cell content is distinct numeric data).
+func isTableLeaf(s *Section) bool {
+	return s.Metadata != nil && s.Metadata["table"] == "true"
+}
+
+// collapseSingleLeafParents recursively flattens every parent that has
+// exactly one child which is a (non-table) leaf: the parent absorbs the
+// child's content + page range and itself becomes the leaf. Chains
+// (heading -> subheading -> body) collapse fully in one bottom-up pass.
+//
+// Leaf count is preserved (one internal node + one leaf become one leaf);
+// the point is purely to turn only-children into adjacent siblings so the
+// adjacent-pair merge can then reduce the count. Returns the rewritten
+// slice.
+func collapseSingleLeafParents(sections []Section) []Section {
+	for i := range sections {
+		s := &sections[i]
+		if len(s.Children) == 0 {
+			continue
+		}
+		// Bottom-up: collapse within the children first so a chain folds
+		// from the leaf upward.
+		s.Children = collapseSingleLeafParents(s.Children)
+		if len(s.Children) == 1 && len(s.Children[0].Children) == 0 && !isTableLeaf(&s.Children[0]) {
+			absorbChildIntoParent(s, s.Children[0])
+			s.Children = nil
+		}
+	}
+	return sections
+}
+
+// collapseOneSingleLeafParent finds the first parent in the tree with
+// exactly one (non-table) leaf child and collapses it (parent absorbs the
+// leaf, becomes a leaf). Returns false when no such parent exists. Used
+// as a defensive fallback inside the merge loop when an adjacent pair was
+// blocked by a table leaf; the bulk flattening is done up front by
+// collapseSingleLeafParents.
+func collapseOneSingleLeafParent(sections *[]Section) bool {
+	s := *sections
+	for i := range s {
+		n := &s[i]
+		if len(n.Children) == 1 && len(n.Children[0].Children) == 0 && !isTableLeaf(&n.Children[0]) {
+			absorbChildIntoParent(n, n.Children[0])
+			n.Children = nil
+			return true
+		}
+		if len(n.Children) > 0 {
+			if collapseOneSingleLeafParent(&n.Children) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// absorbChildIntoParent folds a leaf child's content and page range up
+// into its parent. The parent keeps its own title (the heading) and
+// gains the child's body; an empty parent body is replaced outright so we
+// don't prefix a stray separator. Page ranges union (min start, max end).
+func absorbChildIntoParent(parent *Section, child Section) {
+	parent.Content = joinAbsorbed(parent.Content, child.Title, child.Content)
+	parent.PageStart = minNonZero(parent.PageStart, child.PageStart)
+	if child.PageEnd > parent.PageEnd {
+		parent.PageEnd = child.PageEnd
+	}
+}
+
+// joinAbsorbed appends an absorbed section's text to a survivor's,
+// keeping the absorbed section's TITLE as a bold heading line above its
+// body — the convention foldEmptyLeafSections already uses. Merging is
+// a structural concession to the leaf cap; it must not delete text.
+// Before this, a 10-K's "Item 2. Properties" heading vanished whenever
+// it followed the one-word "Item 1B. Unresolved Staff Comments" (their
+// combined size made them the smallest adjacent pair), and nothing
+// downstream could find where Item 2 began.
+func joinAbsorbed(survivor, absorbedTitle, absorbedBody string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(survivor))
+	if t := strings.TrimSpace(absorbedTitle); t != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("**")
+		b.WriteString(t)
+		b.WriteString("**")
+	}
+	if body := strings.TrimSpace(absorbedBody); body != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(body)
+	}
+	return b.String()
+}
+
+// mergeOneSmallestAdjacentLeafPair finds the adjacent leaf-sibling pair
+// with the smallest combined content length anywhere in the tree and
+// merges it in place. Only pairs where BOTH siblings are NON-table leaves
+// are eligible — table sections are never merged. Returns false when no
+// sibling list has two adjacent mergeable leaves.
+func mergeOneSmallestAdjacentLeafPair(sections []Section) bool {
+	bestList := (*[]Section)(nil)
+	bestIdx := -1
+	bestSize := -1
+
+	var walk func(list *[]Section)
+	walk = func(list *[]Section) {
+		s := *list
+		for i := 0; i+1 < len(s); i++ {
+			if len(s[i].Children) == 0 && len(s[i+1].Children) == 0 &&
+				!isTableLeaf(&s[i]) && !isTableLeaf(&s[i+1]) {
+				size := len(s[i].Content) + len(s[i+1].Content)
+				if bestSize < 0 || size < bestSize {
+					bestSize, bestList, bestIdx = size, list, i
+				}
+			}
+		}
+		for i := range s {
+			if len(s[i].Children) > 0 {
+				walk(&s[i].Children)
+			}
+		}
+	}
+	walk(&sections)
+
+	if bestList == nil {
+		return false
+	}
+	s := *bestList
+	a, b := s[bestIdx], s[bestIdx+1]
+	merged := a
+	merged.Content = joinAbsorbed(a.Content, b.Title, b.Content)
+	merged.PageStart = minNonZero(a.PageStart, b.PageStart)
+	if b.PageEnd > merged.PageEnd {
+		merged.PageEnd = b.PageEnd
+	}
+	s[bestIdx] = merged
+	*bestList = append(s[:bestIdx+1], s[bestIdx+2:]...)
+	return true
+}
+
+// minNonZero returns the smaller of two page numbers, treating 0
+// (unknown) as "no lower bound" so a known page always wins.
+func minNonZero(a, b int) int {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
+}
+
+// chunkOversizedLeaves splits any LEAF section whose content exceeds
+// leafChunkThreshold into smaller sub-sections. Internal nodes (sections with
+// children) are recursed into but never split — they're already structured.
+func chunkOversizedLeaves(sections []Section) []Section {
+	out := make([]Section, 0, len(sections))
+	for _, s := range sections {
+		if len(s.Children) > 0 {
+			s.Children = chunkOversizedLeaves(s.Children)
+			out = append(out, s)
+			continue
+		}
+		if len(s.Content) <= leafChunkThreshold {
+			out = append(out, s)
+			continue
+		}
+		pieces := splitContentByWords(s.Content, leafChunkTarget)
+		if len(pieces) <= 1 {
+			out = append(out, s)
+			continue
+		}
+		parent := Section{Level: s.Level, Title: s.Title, PageStart: s.PageStart, PageEnd: s.PageEnd}
+		for i, piece := range pieces {
+			fallback := fmt.Sprintf("%s — part %d", s.Title, i+1)
+			// We don't track per-chunk pages once content is byte-split — each
+			// chunk inherits the parent's range (the leaf is the same source
+			// material). Good-enough for retrieval citations.
+			parent.Children = append(parent.Children, Section{
+				Level:     s.Level + 1,
+				Title:     deriveChunkTitle(piece, fallback),
+				Content:   piece,
+				PageStart: s.PageStart,
+				PageEnd:   s.PageEnd,
+			})
+		}
+		out = append(out, parent)
+	}
+	return out
+}
+
+// splitContentByWords breaks a long string into pieces near target size at
+// word boundaries. The last piece may be smaller; pieces are never midword.
+func splitContentByWords(s string, target int) []string {
+	s = strings.TrimSpace(s)
+	if target < 200 {
+		target = 200
+	}
+	slack := target / 4
+	if len(s) <= target+slack {
+		return []string{s}
+	}
+	var chunks []string
+	for len(s) > 0 {
+		if len(s) <= target+slack {
+			chunks = append(chunks, strings.TrimSpace(s))
+			break
+		}
+		upper := target + slack
+		if upper > len(s) {
+			upper = len(s)
+		}
+		cut := strings.LastIndex(s[:upper], " ")
+		if cut < target/2 {
+			cut = upper // no good break: hard-cut at upper bound
+		}
+		chunks = append(chunks, strings.TrimSpace(s[:cut]))
+		s = strings.TrimSpace(s[cut:])
+	}
+	return chunks
+}
+
+// deriveChunkTitle picks a readable label for a content chunk. Prefers a
+// phrase ending in ":" within the first ~80 chars (filings use these as
+// natural sub-headers, e.g. "Securities registered pursuant to Section 12(b)
+// of the Act:"); otherwise takes the first ~60 chars trimmed at a word
+// boundary. Falls back to the supplied default when degenerate.
+func deriveChunkTitle(chunk, fallback string) string {
+	s := strings.TrimSpace(chunk)
+	if s == "" {
+		return fallback
+	}
+	if i := strings.Index(s, ":"); i > 0 && i < 80 {
+		candidate := strings.TrimSpace(s[:i])
+		if len(strings.Fields(candidate)) >= 2 {
+			return candidate
+		}
+	}
+	if len(s) <= 60 {
+		return strings.TrimRight(s, " ,;.:")
+	}
+	cut := strings.LastIndex(s[:60], " ")
+	if cut < 30 {
+		cut = 60
+	}
+	t := strings.TrimRight(strings.TrimSpace(s[:cut]), " ,;.:")
+	if t == "" {
+		return fallback
+	}
+	return t
+}
+
+type pdfRow struct {
+	page     int
+	fontSize float64
+	bold     bool
+	text     string
+}
+
+// extractPDFRows walks each page of doc, asks pdftable for positioned
+// Words, and groups them into rows by visual top (Y1 in PDF user space).
+// pdftable's Words() already takes care of intra-word glyph reassembly,
+// letter-spacing collapse, and ligature expansion — so this layer just
+// has to bucket words back into lines and tally the dominant font size
+// + bold ratio per row.
+//
+// The bucket tolerance (Y1 within 2pt) matches what the previous
+// ledongthuc-backed implementation used; word-level Y1 jitter is the
+// same scale as the per-glyph jitter it replaced.
+// extractPDFRows walks each page, grouping glyphs into rows by Y-position
+// and recording the dominant font size + bold ratio per row.
+//
+// We use ledongthuc/pdf's Content() as the primitive source rather than
+// pdftable.Words() because pdftable v0.3.0's word grouping silently
+// concatenates adjacent words on the standard-14 fonts SEC filings use
+// (no bundled AFM widths → glyph X-advance estimated wrong → word
+// X-gaps collapse → "Currentmarketablesecurities"). The X-gap-into-spaces
+// heuristic below is robust to that because we never trust pdftable's
+// word boundaries — we re-derive them from raw glyph X positions.
+//
+// Once pdftable bundles standard-14 AFM metrics (v0.4.x goal) we can
+// swap back to its Words() output.
+func extractPDFRows(doc pdftable.Document) ([]pdfRow, error) {
+	// pdftable's Words() mutates the same package-level state as OpenBytes
+	// (see pdftableOpenMu) — it is not safe for concurrent callers, and
+	// ingest workers parse documents in parallel. Serialize it too until
+	// pdftable itself is made concurrency-safe. (Proper fix tracked in the
+	// Foundational Libraries project.)
+	pdftableOpenMu.Lock()
+	defer pdftableOpenMu.Unlock()
+
+	numPages := doc.NumPages()
+	var out []pdfRow
+
+	// pdftable v0.4.0 word extraction: a size-relative gap tolerance plus
+	// explicit-space boundaries give correct reading order and word
+	// spacing on real design/academic PDFs — replacing the ledongthuc
+	// glyph path that produced reversed, replacement-char-laden text.
+	wopts := pdftable.WordOpts{
+		XTolerance:        3,
+		XToleranceRatio:   0.15,
+		YTolerance:        3,
+		HorizontalLTR:     true,
+		VerticalTTB:       true,
+		Expand:            true,
+		UseExplicitSpaces: true,
+	}
+
+	for pageNum := 1; pageNum <= numPages; pageNum++ {
+		page, perr := doc.Page(pageNum)
+		if perr != nil {
+			continue
+		}
+		words, werr := page.Words(wopts)
+		if werr != nil {
+			continue
+		}
+
+		// Bucket words into rows by visual top (Y1), within 2pt — PDFs
+		// frequently jitter Y by a fraction.
+		type rowBucket struct {
+			y     float64
+			maxFS float64
+			words []pdftable.Word
+		}
+		var buckets []*rowBucket
+		find := func(y float64) *rowBucket {
+			for _, b := range buckets {
+				if abs(b.y-y) < 2.0 {
+					return b
+				}
+			}
+			b := &rowBucket{y: y}
+			buckets = append(buckets, b)
+			return b
+		}
+		for _, wd := range words {
+			// Drop rotated / vertical text runs — arXiv left-margin
+			// stamps, page-edge watermarks, rotated figure labels. These
+			// are page furniture, not body prose, and pdftable reads a
+			// rotated run in an order that surfaces as reversed text
+			// ("3202 guA" for a rotated "Aug 2023", "]LC.sc[" for
+			// "[cs.CL]"), which then pollutes the outline with junk
+			// headings/titles. Upright left-to-right / right-to-left
+			// prose (including real RTL languages) is kept.
+			if isRotatedRun(wd.Upright, wd.Direction) {
+				continue
+			}
+			b := find(wd.Y1)
+			b.words = append(b.words, wd)
+			if wd.FontSize > b.maxFS {
+				b.maxFS = wd.FontSize
+			}
+		}
+		sort.Slice(buckets, func(i, j int) bool { return buckets[i].y > buckets[j].y })
+
+		for _, b := range buckets {
+			// Left-to-right. pdftable already resolved word boundaries +
+			// spacing, so we just order the words and join them.
+			sort.Slice(b.words, func(i, j int) bool { return b.words[i].X0 < b.words[j].X0 })
+			var sb strings.Builder
+			boldGlyphs, totalGlyphs := 0, 0
+			for i, wd := range b.words {
+				if i > 0 {
+					sb.WriteString(" ")
+				}
+				sb.WriteString(wd.Text)
+				n := len([]rune(strings.TrimSpace(wd.Text)))
+				totalGlyphs += n
+				if isBoldFont(wd.FontName) {
+					boldGlyphs += n
+				}
+			}
+			// Wide letter-tracking — common on filing cover pages and
+			// bold section headers — makes every glyph gap exceed the
+			// space threshold, yielding "U N I T E D   S T A T E S".
+			// Re-join those runs into real words.
+			text := collapseLetterSpacing(strings.TrimSpace(sb.String()))
+			if text == "" {
+				continue
+			}
+			if isBoilerplateLine(text) {
+				continue
+			}
+			out = append(out, pdfRow{
+				page:     pageNum,
+				fontSize: b.maxFS,
+				bold:     totalGlyphs > 0 && boldGlyphs*2 > totalGlyphs,
+				text:     text,
+			})
+		}
+	}
+	return out, nil
+}
+
+// multiSpaceRe matches two or more consecutive whitespace characters.
+var multiSpaceRe = regexp.MustCompile(`\s{2,}`)
+
+// looksLetterSpaced reports whether s appears to have been rendered with
+// wide letter-tracking — a chain of single characters separated by
+// spaces ("U N I T E D"). Used to detect cover-page / heading rows that
+// the glyph-spacing heuristic over-split.
+func looksLetterSpaced(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 5 {
+		return false
+	}
+	parts := strings.Fields(s)
+	if len(parts) < 4 {
+		return false
+	}
+	singles := 0
+	for _, p := range parts {
+		if len(p) <= 1 {
+			singles++
+		}
+	}
+	// At least half of the parts must be single characters for us to
+	// call the run letter-spaced.
+	return singles*2 >= len(parts)
+}
+
+// collapseLetterSpacing rejoins runs of single-character "words"
+// (the artifact of wide letter-tracking) into real words. Multi-space
+// gaps between letter-spaced groups become regular word boundaries.
+func collapseLetterSpacing(s string) string {
+	if !looksLetterSpaced(s) {
+		return s
+	}
+	// Split on runs of 2+ spaces to identify word groups, then collapse
+	// each group's single-character chain.
+	groups := multiSpaceRe.Split(s, -1)
+	for i, g := range groups {
+		parts := strings.Fields(g)
+		// If every part is a single character, glue them.
+		allSingles := true
+		for _, p := range parts {
+			if len(p) > 1 {
+				allSingles = false
+				break
+			}
+		}
+		if allSingles {
+			groups[i] = strings.Join(parts, "")
+		}
+	}
+	return strings.Join(groups, " ")
+}
+
+// buildHeadingLevelMap returns a map from rounded-font-size → heading level
+// (1 = largest = h1). Only sizes above headingFloor are considered.
+// Levels are capped at 6.
+func buildHeadingLevelMap(rows []pdfRow, floor float64) map[int]int {
+	seen := map[int]bool{}
+	for _, r := range rows {
+		if r.fontSize > floor {
+			seen[roundSize(r.fontSize)] = true
+		}
+	}
+	var bigs []int
+	for k := range seen {
+		bigs = append(bigs, k)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(bigs)))
+
+	out := make(map[int]int, len(bigs))
+	for i, sz := range bigs {
+		lvl := i + 1
+		if lvl > 6 {
+			lvl = 6
+		}
+		out[sz] = lvl
+	}
+	return out
+}
+
+// roundSize rounds a font size to the nearest 0.5pt, expressed as an int
+// (×2) so it can key a map. Two glyphs with nominally the same font size
+// often jitter by a fraction of a point.
+func roundSize(s float64) int {
+	return int(s*2 + 0.5)
+}
+
+// parsePDFWithOutline builds a ParsedDoc using the PDF's /Outlines as
+// the structural ground truth. For each outline entry (depth-first,
+// pre-order) we scan forward through rows starting at the last match
+// position and treat the first matching row as that heading. Content
+// between one outline match and the next is the preceding heading's
+// body.
+//
+// Returns ok=false if we can't match enough outline entries to rows —
+// in which case the caller falls back to the font-size heuristic.
+func parsePDFWithOutline(outline pdflib.Outline, rows []pdfRow) (*ParsedDoc, bool) {
+	// Flatten outline to (level, title) pairs via depth-first walk.
+	type entry struct {
+		level int
+		title string
+	}
+	var flat []entry
+	var walk func(nodes []pdflib.Outline, depth int)
+	walk = func(nodes []pdflib.Outline, depth int) {
+		lvl := depth + 1
+		if lvl > 6 {
+			lvl = 6
+		}
+		for _, n := range nodes {
+			t := strings.TrimSpace(n.Title)
+			if t != "" {
+				flat = append(flat, entry{level: lvl, title: t})
+			}
+			walk(n.Child, depth+1)
+		}
+	}
+	walk(outline.Child, 0)
+	if len(flat) == 0 {
+		return nil, false
+	}
+
+	// Match each outline title to the first row at or after the cursor
+	// whose normalized text begins with the normalized title. This is
+	// forgiving of trailing page numbers, section numbering prefixes the
+	// outline sometimes omits, etc.
+	type matched struct {
+		level  int
+		title  string
+		rowIdx int // index into rows where this heading starts
+	}
+	var chosen []matched
+	cursor := 0
+	for _, e := range flat {
+		want := normalizeForMatch(e.title)
+		found := -1
+		for i := cursor; i < len(rows); i++ {
+			if strings.HasPrefix(normalizeForMatch(rows[i].text), want) {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			continue
+		}
+		chosen = append(chosen, matched{level: e.level, title: e.title, rowIdx: found})
+		cursor = found + 1
+	}
+	// Require at least half the outline to match, otherwise the outline
+	// likely doesn't describe the text we extracted (encrypted fonts,
+	// weird glyph mappings) and we should fall back.
+	if len(chosen)*2 < len(flat) {
+		return nil, false
+	}
+
+	// Assemble sections: body text is the concatenation of rows between
+	// one match and the next (exclusive). Page range = min/max page across
+	// the heading row + body rows.
+	rootSec := &Section{Level: 0}
+	stack := []*Section{rootSec}
+	for i, m := range chosen {
+		end := len(rows)
+		if i+1 < len(chosen) {
+			end = chosen[i+1].rowIdx
+		}
+		var body strings.Builder
+		minPage, maxPage := rows[m.rowIdx].page, rows[m.rowIdx].page
+		for _, row := range rows[m.rowIdx+1 : end] {
+			text := strings.TrimSpace(row.text)
+			if text == "" {
+				continue
+			}
+			if body.Len() > 0 {
+				body.WriteByte(' ')
+			}
+			body.WriteString(text)
+			if row.page > 0 && (minPage == 0 || row.page < minPage) {
+				minPage = row.page
+			}
+			if row.page > maxPage {
+				maxPage = row.page
+			}
+		}
+		sec := Section{
+			Level:     m.level,
+			Title:     m.title,
+			Content:   body.String(),
+			PageStart: minPage,
+			PageEnd:   maxPage,
+		}
+		for len(stack) > 1 && stack[len(stack)-1].Level >= sec.Level {
+			stack = stack[:len(stack)-1]
+		}
+		parent := stack[len(stack)-1]
+		parent.Children = append(parent.Children, sec)
+		tail := &parent.Children[len(parent.Children)-1]
+		stack = append(stack, tail)
+	}
+
+	title := ""
+	if len(rootSec.Children) > 0 {
+		title = rootSec.Children[0].Title
+	}
+
+	// Fold empty leaf fragments, then propagate page ranges so internal
+	// nodes span their children.
+	rootSec.Children = foldEmptyLeafSections(rootSec.Children)
+	propagateSectionPages(rootSec.Children)
+
+	return &ParsedDoc{
+		Title:    title,
+		Sections: rootSec.Children,
+	}, true
+}
+
+// normalizeForMatch lowercases, strips punctuation, and collapses
+// whitespace so outline titles match row text despite cosmetic drift.
+func normalizeForMatch(s string) string {
+	var b strings.Builder
+	prevSpace := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevSpace = false
+		case r == ' ' || r == '\t' || r == '\n':
+			if !prevSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// boilerplateSignatures are substrings (lower-cased) that mark a line
+// as publisher / preprint / license boilerplate rather than document
+// content. Kept deliberately specific so we never drop real prose —
+// each phrase is something that essentially only appears in a
+// copyright/license stamp.
+var boilerplateSignatures = []string{
+	"hereby grants permission",
+	"provided proper attribution is provided",
+	"solely for use in journalistic",
+	"all rights reserved",
+	"is licensed under a creative commons",
+	"licensed under cc by",
+	"this work is licensed under",
+	"permission to make digital or hard copies",
+	"copyright held by the owner",
+	"preprint. under review",
+	"preprint submitted to",
+}
+
+// boilerplateFragments are short tails of a license sentence that the
+// PDF splits onto their own row (e.g. "...journalistic or scholarly
+// works." → a lone "scholarly works." row). These are too generic to
+// match anywhere in a line, so we only drop them when the whole row
+// is a short fragment (≤ 4 words) — real prose using the phrase lives
+// inside a longer sentence.
+var boilerplateFragments = []string{
+	"scholarly works",
+	"journalistic or",
+	"or scholarly",
+}
+
+// isRepeatedMarkerLine reports whether a row is a run of the same short
+// token repeated — the artifact of an icon glyph rendered as text and
+// stamped once per item, e.g. the ORCID "iD" logo repeated once per author
+// on a paper's byline ("iD iD iD iD"). Real prose never repeats an
+// identical ≤2-character token as the majority of a ≥3-token line, so
+// dropping these is safe and removes the junk author-block "headings"
+// (e.g. PRISMA's contributor page) the font heuristic would otherwise
+// surface as sections.
+func isRepeatedMarkerLine(s string) bool {
+	fields := strings.Fields(s)
+	if len(fields) < 3 {
+		return false
+	}
+	counts := map[string]int{}
+	for _, f := range fields {
+		if len([]rune(f)) <= 2 {
+			counts[f]++
+		}
+	}
+	for _, c := range counts {
+		if c*100 >= len(fields)*60 { // ≥60% of the line is one short token
+			return true
+		}
+	}
+	return false
+}
+
+// isBoilerplateLine reports whether a row is publisher/license noise.
+// Matches the curated signature list, the bare arXiv id stamp
+// ("arXiv:2401.01234v2 [cs.CL] 5 Jan 2024"), short license-tail
+// fragments, and repeated icon-glyph marker rows (ORCID "iD iD iD").
+func isBoilerplateLine(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if isRepeatedMarkerLine(low) {
+		return true
+	}
+	for _, sig := range boilerplateSignatures {
+		if strings.Contains(low, sig) {
+			return true
+		}
+	}
+	// arXiv margin stamp: starts with "arxiv:" followed by a digit.
+	if strings.HasPrefix(low, "arxiv:") && len(low) > 6 && low[6] >= '0' && low[6] <= '9' {
+		return true
+	}
+	// Short license-tail fragments.
+	if len(strings.Fields(low)) <= 4 {
+		for _, frag := range boilerplateFragments {
+			if strings.Contains(low, frag) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// numberedHeadingRe matches a leading section number like "3", "3.1",
+// "3.1.2", or "3." followed by whitespace and the heading text.
+var numberedHeadingRe = regexp.MustCompile(`^(\d+(?:\.\d+)*)\.?\s+\S`)
+
+// numberedHeadingDepth returns the nesting depth implied by a leading
+// section number: "3 Foo" → 1, "3.1 Bar" → 2, "3.1.2 Baz" → 3. Returns
+// ok=false when there is no numbered prefix. Depth is clamped to 6.
+//
+// Callers use depth>1 only to deepen a heading relative to its font-size
+// level — never to set the absolute level — so numbered and unnumbered
+// top-level headings remain siblings.
+func numberedHeadingDepth(s string) (int, bool) {
+	m := numberedHeadingRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, false
+	}
+	depth := strings.Count(m[1], ".") + 1
+	if depth > 6 {
+		depth = 6
+	}
+	return depth, true
+}
+
+func looksLikeHeading(s string) bool {
+	// Headings are rarely > 25 words and never end with sentence punctuation
+	// from the middle of a paragraph. (Filing headings like "Item 2.
+	// Management's Discussion and Analysis of Financial Condition and Results
+	// of Operations" run long, so the cap is generous.)
+	words := strings.Fields(s)
+	if len(words) == 0 || len(words) > 25 {
+		return false
+	}
+	// Common body-text tells: trailing comma, trailing ellipsis.
+	if strings.HasSuffix(s, ",") {
+		return false
+	}
+	return true
+}
+
+// isRotatedRun reports whether a pdftable word run is rotated / vertical
+// text — page furniture (margin stamps, watermarks, rotated labels)
+// rather than body prose. pdftable marks such a run as not Upright and/or
+// with a vertical reading Direction ("ttb"/"btt"); it reads them in an
+// order that surfaces as reversed text, so dropping them keeps the outline
+// clean. Upright horizontal prose in either LTR or RTL scripts is body
+// text and is never dropped.
+func isRotatedRun(upright bool, direction string) bool {
+	if !upright {
+		return true
+	}
+	switch strings.ToLower(direction) {
+	case "ttb", "btt":
+		return true
+	}
+	return false
+}
+
+// isBoldFont reports whether a PDF font name denotes a bold weight. SEC filing
+// section headings are typically bold at body font size (not larger), so this is
+// how we recover them — a size-only heuristic misses them entirely.
+func isBoldFont(font string) bool {
+	f := strings.ToLower(font)
+	return strings.Contains(f, "bold") || strings.Contains(f, "-bd") || strings.Contains(f, ",bd")
+}
+
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
+
+// rowsLookLikeUsableText is a coarse sanity check. PDFs with an
+// overlay watermark drawn at the same Y coordinate as the real text
+// produce extracted rows where chars from both layers are interleaved
+// — the row text ends up with doubled glyphs ("GGlloobbaall") that
+// look like text to len() but contain no actual words. The signal
+// we look for is "are at least some rows of normal length and contain
+// vowel + consonant patterns rather than runs of repeated chars".
+func rowsLookLikeUsableText(rows []pdfRow) bool {
+	usable := 0
+	for _, r := range rows {
+		t := strings.TrimSpace(r.text)
+		if len(t) < 4 {
+			continue
+		}
+		if hasRepeatedAdjacentChars(t) {
+			continue
+		}
+		usable++
+		if usable >= 5 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRepeatedAdjacentChars returns true if more than 30% of letter
+// pairs in s are the same letter twice in a row (case-insensitive).
+// That's the signature of "GGlloobbaall" interleaving.
+func hasRepeatedAdjacentChars(s string) bool {
+	letters := 0
+	doubled := 0
+	prev := rune(0)
+	for _, r := range strings.ToLower(s) {
+		if r < 'a' || r > 'z' {
+			prev = 0
+			continue
+		}
+		letters++
+		if r == prev {
+			doubled++
+		}
+		prev = r
+	}
+	if letters < 4 {
+		return false
+	}
+	return doubled*100/letters > 30
+}
+
+// isEncryptedPDFError reports whether the given error from
+// ledongthuc/pdf indicates the document is encrypted. The library
+// has no proper error type for this, so we match on the message.
+//
+
+// decryptPDFWithEmptyPassword strips the encryption dict from a PDF
+// using pdfcpu, assuming an empty user password (the common case for
+// owner-password-only / "permissions" encryption). Returns the cleaned
+// bytes that any unencrypted-PDF parser can consume.
+func decryptPDFWithEmptyPassword(in []byte) ([]byte, error) {
+	conf := model.NewDefaultConfiguration()
+	conf.UserPW = ""
+	conf.OwnerPW = ""
+	// pdfcpu is conservative by default and won't strip encryption
+	// without explicit owner permission acknowledgement when the doc
+	// has restrictive perms. We're decrypting purely to extract text
+	// for indexing — the user already uploaded the PDF intending it
+	// to be searchable, so this is consistent with their intent.
+	conf.OwnerPWNew = nil
+	conf.UserPWNew = nil
+	var out bytes.Buffer
+	if err := api.Decrypt(bytes.NewReader(in), &out, conf); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// isPdftableEncryptedErr reports whether the given pdftable error is
+// the sentinel for an encrypted PDF. pdftable surfaces ErrEncrypted via
+// errors.Is, which is what we use here so we stay forward-compatible if
+// the wrapping ever changes.
+func isPdftableEncryptedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, pdftable.ErrEncrypted) {
+		return true
+	}
+	// Defensive fallback: even if the sentinel ever changes name we
+	// still want to retry through pdfcpu rather than fail open.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "encrypted") || strings.Contains(msg, "encryption")
+}
+
+// extractPDFTables runs pdftable's table-finding pipeline over every
+// page of doc and returns one Section per detected table. Each
+// returned section carries:
+//
+//   - Title: "Table (page N)" for callers/UIs that want a stable label.
+//   - Content: a GitHub-flavoured Markdown rendering of the cells.
+//   - PageStart/PageEnd: the page the table was found on (always equal
+//     because pdftable does not yet cross-page-merge tables).
+//   - Metadata["table"]="true": retrieval can branch on this to apply
+//     numeric-content-aware ranking; the rows/cols entries surface the
+//     shape for debugging and per-document analytics.
+//
+// Errors during table extraction are LOGGED and SWALLOWED — the engine's
+// commitment is that bad PDFs never break ingest. A panic inside
+// pdftable (defensive guard) is also caught.
+//
+// Pass opts=nil or opts.Enabled=false to short-circuit; the function
+// then returns nil cheaply without walking the document.
+func extractPDFTables(doc pdftable.Document, opts *TableOpts) []Section {
+	if opts == nil || !opts.Enabled {
+		return nil
+	}
+	settings := pdftable.DefaultTableSettings()
+	if opts.VerticalStrategy != "" {
+		settings.VerticalStrategy = pdftable.TableStrategy(opts.VerticalStrategy)
+	}
+	if opts.HorizontalStrategy != "" {
+		settings.HorizontalStrategy = pdftable.TableStrategy(opts.HorizontalStrategy)
+	}
+	minRows := opts.MinTableRows
+	minCols := opts.MinTableCols
+
+	var sections []Section
+	// Total table-extraction budget across the whole document. pdftable's
+	// finder is geometry-heavy and has pathological cases on dense
+	// financial pages (a balance sheet with hundreds of ruling segments
+	// can blow up the intersection grid). Once the doc-wide budget is
+	// spent we stop extracting tables on the remaining pages and let
+	// ingest proceed text-only — a doc with no table sections still
+	// indexes fine (the page text, including the table's text, is in the
+	// prose sections).
+	deadline := time.Now().Add(tableExtractDocBudget)
+	for n := 1; n <= doc.NumPages(); n++ {
+		if time.Now().After(deadline) {
+			slog.Warn("pdf: table-extraction doc budget exhausted; skipping remaining pages",
+				"pages_done", n-1, "total_pages", doc.NumPages())
+			break
+		}
+		page, err := doc.Page(n)
+		if err != nil {
+			continue
+		}
+		tables := safeExtractTables(page, settings, n)
+		for _, t := range tables {
+			if t == nil {
+				continue
+			}
+			rows := normaliseTableRows(t.Rows)
+			if len(rows) < minRows {
+				continue
+			}
+			cols := 0
+			if len(rows) > 0 {
+				cols = len(rows[0])
+			}
+			if cols < minCols {
+				continue
+			}
+			md := tableToMarkdown(rows)
+			if strings.TrimSpace(md) == "" {
+				continue
+			}
+			sections = append(sections, Section{
+				Level:     1,
+				Title:     fmt.Sprintf("Table (page %d)", n),
+				Content:   md,
+				PageStart: n,
+				PageEnd:   n,
+				Metadata: map[string]string{
+					"table": "true",
+					"rows":  fmt.Sprintf("%d", len(rows)),
+					"cols":  fmt.Sprintf("%d", cols),
+				},
+			})
+		}
+	}
+	return sections
+}
+
+// Table-extraction time bounds. pdftable's finder is pure geometry (no
+// LLM, so the ingest LLM-call timeout doesn't cover it) and has
+// pathological cases on dense financial pages where the
+// intersection-grid construction blows up. A 92-page 10-K was observed
+// stuck in `parsing` for 20+ minutes on a single such page. These
+// bounds keep table extraction strictly time-boxed:
+//   - tableExtractPageTimeout caps any single page.
+//   - tableExtractDocBudget caps the whole document (checked in the
+//     page loop); once spent, remaining pages are skipped text-only.
+const (
+	tableExtractPageTimeout = 15 * time.Second
+	tableExtractDocBudget   = 90 * time.Second
+)
+
+// safeExtractTables wraps page.ExtractTables so a bug — or a pathological
+// O(n^2) page — deep inside pdftable can never take down (or hang) the
+// engine's ingest pipeline. It runs the extraction on a goroutine and
+// abandons it if it exceeds tableExtractPageTimeout. Errors, panics, and
+// timeouts are logged at warn level; the document still ingests, just
+// without that page's tables.
+func safeExtractTables(page pdftable.Page, settings pdftable.TableSettings, pageNum int) []*pdftable.Table {
+	type result struct {
+		tables []*pdftable.Table
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Warn("pdf: table extraction panicked",
+					"page", pageNum, "panic", fmt.Sprintf("%v", r))
+				done <- result{}
+			}
+		}()
+		// pdftable mutates package-level state during table extraction too,
+		// not just OpenBytes — serialize it on the same mutex. Stopgap until
+		// pdftable is made concurrency-safe (HAL-118).
+		pdftableOpenMu.Lock()
+		t, err := page.ExtractTables(settings)
+		pdftableOpenMu.Unlock()
+		done <- result{tables: t, err: err}
+	}()
+
+	select {
+	case <-time.After(tableExtractPageTimeout):
+		// The goroutine is abandoned (it will finish on its own and the
+		// buffered channel lets it send without blocking, then get GC'd).
+		// A single slow page is not worth stalling the whole ingest.
+		slog.Warn("pdf: table extraction timed out; skipping page",
+			"page", pageNum, "timeout", tableExtractPageTimeout)
+		return nil
+	case res := <-done:
+		if res.err != nil {
+			slog.Warn("pdf: table extraction failed",
+				"page", pageNum, "err", res.err)
+			return nil
+		}
+		return res.tables
+	}
+}
+
+// normaliseTableRows trims whitespace per cell and pads short rows out
+// to the table's max column count. pdftable can emit rows with fewer
+// cells than the header when its cell detection finds a hole; we
+// promote those to empty strings so Markdown rendering produces a
+// well-formed grid (every row has the same column count).
+func normaliseTableRows(rows [][]string) [][]string {
+	maxCols := 0
+	for _, r := range rows {
+		if len(r) > maxCols {
+			maxCols = len(r)
+		}
+	}
+	if maxCols == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(rows))
+	for _, r := range rows {
+		row := make([]string, maxCols)
+		for i := 0; i < maxCols; i++ {
+			if i < len(r) {
+				row[i] = strings.TrimSpace(r[i])
+			} else {
+				row[i] = ""
+			}
+		}
+		// Drop entirely blank rows — they're cell-detection artefacts
+		// and contribute no information to retrieval.
+		if !isAllBlank(row) {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// isAllBlank reports whether every cell in row is empty/whitespace.
+func isAllBlank(row []string) bool {
+	for _, c := range row {
+		if strings.TrimSpace(c) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// tableToMarkdown renders a normalised table-rows slice as a
+// GitHub-flavoured Markdown table. The first row is treated as the
+// header; if it is entirely blank, a row of empty header cells is
+// emitted so the markdown stays well-formed.
+//
+// Cell content is escaped minimally: pipe characters inside a cell are
+// replaced with the HTML entity so they don't terminate the cell. We
+// don't escape backslashes or newlines — newlines inside a cell would
+// break the GFM table syntax, so we collapse them to spaces here too.
+func tableToMarkdown(rows [][]string) string {
+	if len(rows) == 0 || len(rows[0]) == 0 {
+		return ""
+	}
+	cols := len(rows[0])
+	var sb strings.Builder
+
+	emitRow := func(cells []string) {
+		sb.WriteByte('|')
+		for i := 0; i < cols; i++ {
+			cell := ""
+			if i < len(cells) {
+				cell = escapeMarkdownCell(cells[i])
+			}
+			sb.WriteByte(' ')
+			sb.WriteString(cell)
+			sb.WriteByte(' ')
+			sb.WriteByte('|')
+		}
+		sb.WriteByte('\n')
+	}
+
+	// Header row.
+	header := rows[0]
+	if isAllBlank(header) {
+		header = make([]string, cols)
+	}
+	emitRow(header)
+
+	// Separator row (GFM uses --- per column).
+	sb.WriteByte('|')
+	for i := 0; i < cols; i++ {
+		sb.WriteString(" --- |")
+	}
+	sb.WriteByte('\n')
+
+	// Data rows.
+	for _, r := range rows[1:] {
+		emitRow(r)
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// escapeMarkdownCell makes a cell safe for inclusion in a GFM table:
+// pipes are entity-encoded (they would otherwise close the cell) and
+// embedded newlines / tabs are collapsed to single spaces (GFM tables
+// are single-line per cell). Runs of whitespace produced by the
+// collapse are squashed to one space for readability.
+func escapeMarkdownCell(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "|", "&#124;")
+	// Newlines and tabs become spaces; multiple spaces collapse.
+	repl := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ", "\t", " ")
+	s = repl.Replace(s)
+	// Squash runs of spaces.
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return strings.TrimSpace(s)
+}
+
+// attachTableSections appends every table section to doc.Sections at
+// the document root, after a synthetic "Tables" parent — keeping
+// retrieval able to find them but not interleaving them with the
+// document outline (which would confuse callers that rely on outline
+// order matching page order).
+//
+// We always create a single "Tables" parent so the top level of the
+// outline doesn't balloon: a 10-K with 80 tables would otherwise dwarf
+// the actual section list. The parent inherits the union of its
+// children's page ranges.
+func attachTableSections(doc *ParsedDoc, tables []Section) {
+	if doc == nil || len(tables) == 0 {
+		return
+	}
+	parent := Section{
+		Level:    1,
+		Title:    "Tables",
+		Children: tables,
+		Metadata: map[string]string{"tables_container": "true"},
+	}
+	// Compute the parent's page span as the union of children's.
+	for _, t := range tables {
+		if t.PageStart > 0 && (parent.PageStart == 0 || t.PageStart < parent.PageStart) {
+			parent.PageStart = t.PageStart
+		}
+		if t.PageEnd > parent.PageEnd {
+			parent.PageEnd = t.PageEnd
+		}
+	}
+	doc.Sections = append(doc.Sections, parent)
+}
