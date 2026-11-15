@@ -1,0 +1,1261 @@
+package ingest
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/hallelx2/llmgate"
+
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+)
+
+// PageText pairs a 1-indexed PDF page number with its extracted
+// text. The TOC builder reasons over a slice of these in page order
+// — it never sees raw PDF bytes, so it works equally well over the
+// pages produced by the existing parser pipeline and over synthetic
+// fixtures used in tests.
+type PageText struct {
+	PageNumber int    `json:"page_number"`
+	Text       string `json:"text"`
+}
+
+// TOCBuilder builds an LLM-derived table-of-contents tree for a
+// document. The shape mirrors TreeWalk's three-phase pipeline:
+//
+//  1. detect    — scan the first TOCCheckPages pages and ask the LLM
+//     whether any of them looks like a real TOC.
+//  2. extract   — if a TOC page was found, ask the LLM to parse it
+//     into structured nodes; otherwise call the no-TOC
+//     path that generates a TOC straight from body
+//     text (the LLM is given the full page text tagged
+//     with <physical_index_X> markers it copies back as
+//     the start page).
+//  3. verify    — concurrently re-check each leaf node: does its
+//     title actually appear at the start of the claimed
+//     page? Mismatches are repaired by clearing the
+//     page back to zero; downstream readers treat zero
+//     as "open / unknown" rather than a wrong answer.
+//
+// EndPage is derived from sibling ordering once verification is
+// done. The builder is deliberately tolerant of LLM parse blips
+// (the same retry-then-degrade pattern the rest of the ingest path
+// uses) — a single bad response never fails ingest.
+type TOCBuilder struct {
+	// LLM is the provider client. Required.
+	LLM llmgate.Client
+
+	// Model overrides the client's default. Empty inherits.
+	Model string
+
+	// Concurrency caps parallel LLM calls during the verification
+	// phase. The detect + extract phases run sequentially because
+	// each page-by-page detector call is short and the no-TOC
+	// generator is one big call. Default: 4.
+	Concurrency int
+
+	// TOCCheckPages bounds the prefix the detector scans for a
+	// table of contents. TreeWalk defaults this to 20 — financial
+	// filings put their TOC inside the first dozen pages and a
+	// document with no TOC by page 20 almost never has one
+	// further in. Default: 20.
+	TOCCheckPages int
+
+	// LLMCallTimeout bounds each individual LLM call the builder issues
+	// (every detect, extract, no-TOC-generate, and verify turn). It is
+	// the same safety valve the rest of the ingest pipeline uses: a
+	// single provider call that hangs must not block the builder's
+	// verification errgroup — and therefore the whole document — forever.
+	//
+	// Zero disables the per-call bound, preserving the legacy behaviour
+	// for TOCBuilder literals in tests. The pipeline sets it from
+	// Pipeline.LLMCallTimeout (default 90s).
+	LLMCallTimeout time.Duration
+
+	// Judge optionally routes the two yes/no phases — TOC detection and
+	// title verification — to a System One model, which answers a whole
+	// batch of questions against one reading of the state instead of one
+	// question per round-trip.
+	//
+	// Nil means the generative path runs exactly as before, and that is
+	// the default. A Judge is an accelerator, never a dependency: a
+	// self-hoster without a TypeSafe key must see identical behaviour.
+	//
+	// See toc_judge.go for the batching and for why it is sized by
+	// measured tokens rather than page count.
+	Judge llmgate.Judge
+
+	// OnPhase, when set, hears each phase of Build start and finish
+	// (detect, extract, resolve, split), with the finished phase's
+	// one-line result. Ingest turns it into live progress.
+	OnPhase func(name string, started bool, detail string)
+
+	// MinimalContext turns on the three cuts that send a Judge only what it
+	// needs to answer: a structural pre-filter that skips pages with no
+	// sign of a contents page, hard per-page truncation for detection, and
+	// a two-stage scan that tries the first few pages before the full
+	// prefix.
+	//
+	// Off by default until the evidence-page coverage gate (HAL-1366)
+	// shows it costs nothing — the house rule for any change that alters
+	// which pages a model sees. The design principle it serves: latency on
+	// a System One model is paid in input tokens, so every token sent has
+	// to earn its place.
+	MinimalContext bool
+
+	// SplitLeavesOver splits any leaf spanning more pages than this into
+	// sub-leaves at its internal headings, confirmed by the Judge
+	// (HAL-1374). Zero selects the default of 20 when a Judge is set;
+	// negative disables splitting.
+	SplitLeavesOver int
+
+	// SplitGenerations is how many times a path may be split: 1 (the
+	// default) splits the leaves the contents pass produced and stops.
+	// More descends into the sub-leaves it creates, which measured as
+	// pure cost on FinanceBench — see defaultSplitGenerations.
+	SplitGenerations int
+
+	// DetectChars caps the characters of each page sent to detection when
+	// MinimalContext is on. Zero means detectCharsMinimal. A contents page
+	// declares itself in its first couple of thousand characters; the
+	// other ten thousand are cost.
+	DetectChars int
+
+	// FirstPass is how many leading pages the two-stage scan tries before
+	// falling back to the full prefix. Zero means firstPassDefault. Every
+	// 10-K puts its TOC on page 2–3; the full scan only runs on a miss, so
+	// the worst case costs what the single scan costs today.
+	FirstPass int
+
+	// JudgeThreshold is the probability above which a Noul answer counts
+	// as yes. Zero means 0.5.
+	//
+	// Worth recalibrating per corpus rather than inheriting. The
+	// generative prompts returned a self-reported yes/no; a System One
+	// model returns a calibrated probability, and those are different
+	// quantities even when both live in [0,1].
+	JudgeThreshold float64
+}
+
+// Usage is the cumulative LLM accounting returned by Build. Mirrors
+// the retrieval.Usage shape so callers can fold it into the same
+// per-document cost ledger that the retrieval path uses.
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	CostUSD      float64
+	LLMCalls     int
+
+	// GenerativeCalls counts the chat-completion calls among LLMCalls.
+	// Zero on a Judge-only build; the number to watch when the goal is
+	// to have no generative call in the TOC stage at all.
+	GenerativeCalls int
+
+	// Degraded lists the Judge-path steps that could not complete and
+	// what Build did instead. Empty means every step ran as configured.
+	// A document built with a non-empty Degraded is not wrong, but it is
+	// not what was asked for, and the caller must be able to see that:
+	// VERIZON_2022_10K once ingested with no page on any leaf after a
+	// single failed Judge request, and reported success (HAL-1369).
+	Degraded []string
+
+	// Phases is where Build's time went, in order. Logged with the
+	// totals, so an ingest that is slow says which step was slow.
+	Phases []PhaseTiming
+}
+
+// PhaseTiming is one step of Build: how long it took and how many model
+// calls it made.
+type PhaseTiming struct {
+	Name     string
+	Duration time.Duration
+	Calls    int
+}
+
+// phase closes the step that started at since with callsBefore calls
+// on the ledger, and returns the clock and count for the next one.
+func (u *Usage) phase(name string, since time.Time, callsBefore int) (time.Time, int) {
+	now := time.Now()
+	u.Phases = append(u.Phases, PhaseTiming{Name: name, Duration: now.Sub(since), Calls: u.LLMCalls - callsBefore})
+	return now, u.LLMCalls
+}
+
+// begin and end report a phase to OnPhase.
+func (b *TOCBuilder) begin(name string) {
+	if b.OnPhase != nil {
+		b.OnPhase(name, true, "")
+	}
+}
+
+func (b *TOCBuilder) end(name, detail string) {
+	if b.OnPhase != nil {
+		b.OnPhase(name, false, detail)
+	}
+}
+
+// PhaseSummary renders Phases as "detect=1.2s/2 extract=31.0s/1 …"
+// (duration / model calls) for one log field.
+func (u Usage) PhaseSummary() string {
+	parts := make([]string, 0, len(u.Phases))
+	for _, p := range u.Phases {
+		parts = append(parts, fmt.Sprintf("%s=%.1fs/%d", p.Name, p.Duration.Seconds(), p.Calls))
+	}
+	return strings.Join(parts, " ")
+}
+
+// degrade records a Judge-path step that fell back.
+func (u *Usage) degrade(step, what string) {
+	u.Degraded = append(u.Degraded, step+": "+what)
+}
+
+// add folds the per-response usage from one LLM call into the
+// running total. Keeps the call sites short.
+func (u *Usage) add(r *llmgate.Response) {
+	if r == nil {
+		return
+	}
+	u.InputTokens += r.Usage.InputTokens
+	u.OutputTokens += r.Usage.OutputTokens
+	u.TotalTokens += r.Usage.TotalTokens
+	u.CostUSD += r.Usage.CostUSD
+	u.LLMCalls++
+	u.GenerativeCalls++
+}
+
+// Build runs the three-phase pipeline on pages and returns a
+// flat-ish top-level TOC tree (children inside Nodes form the
+// nested levels). Always returns a non-nil error chain only on a
+// hard transport failure — LLM parse blips degrade to "empty
+// result with logged warning" so the caller's ingest job never
+// dies on a formatting glitch.
+//
+// pages must be in page order (PageNumber strictly ascending and
+// 1-based). Build does not sort or de-duplicate.
+func (b *TOCBuilder) Build(ctx context.Context, pages []PageText) ([]tree.TOCNode, Usage, error) {
+	var usage Usage
+	if len(pages) == 0 {
+		return nil, usage, nil
+	}
+	concurrency := b.Concurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	tocCheck := b.TOCCheckPages
+	if tocCheck <= 0 {
+		tocCheck = 20
+	}
+
+	clock, calls := time.Now(), 0
+
+	// Phase 1: detect. Scan the leading pages for a TOC.
+	b.begin("detect")
+	//
+	// A Judge answers the whole prefix in a couple of batched requests;
+	// without one this is a sequential call per page. handled=false
+	// means the Judge declined or failed, and the generative path runs
+	// unchanged.
+	tocPages, handled := b.detectTOCPagesJudge(ctx, pages, tocCheck, &usage)
+	if !handled {
+		tocPages = b.detectTOCPages(ctx, pages, tocCheck, &usage)
+	}
+	clock, calls = usage.phase("detect", clock, calls)
+	if len(tocPages) > 0 {
+		b.end("detect", fmt.Sprintf("contents on page %d", tocPages[0]))
+	} else {
+		b.end("detect", "no contents page; reading headings")
+	}
+	b.begin("extract")
+
+	// Phase 2: extract.
+	//
+	// With a Judge and a contents page, code lists the entries and the
+	// Judge confirms them — one request, seconds. The generative
+	// extractor runs only when the contents did not parse into enough
+	// entries to trust, or when the Judge failed (recorded as a
+	// degradation, since it is minutes and a body window instead).
+	var nodes []tree.TOCNode
+	var printed map[string]int
+	var err error
+	extracted := false
+	if len(tocPages) > 0 && b.Judge != nil {
+		var handled bool
+		nodes, printed, handled, err = b.extractFromTOCPagesJudge(ctx, pages, tocPages, &usage)
+		if err != nil {
+			log.Printf("toc: judge extraction failed, falling back to the generative extractor: %v", err)
+			usage.degrade("extraction", "generative extractor after a failed Judge request: "+err.Error())
+		}
+		extracted = handled && err == nil
+	}
+	if !extracted {
+		if len(tocPages) > 0 {
+			nodes, err = b.extractFromTOCPages(ctx, pages, tocPages, &usage)
+		} else {
+			nodes, err = b.generateNoTOC(ctx, pages, &usage)
+		}
+		if err != nil {
+			return nil, usage, err
+		}
+	}
+	clock, calls = usage.phase("extract", clock, calls)
+	b.end("extract", fmt.Sprintf("%d entries", len(flattenForVerify(nodes))))
+	if len(nodes) == 0 {
+		b.end("resolve", "nothing to place")
+		b.end("split", "nothing to split")
+		return nil, usage, nil
+	}
+	b.begin("resolve")
+
+	// Phase 3: verify each leaf's claimed start page actually
+	// starts the section. Mismatches clear the page (set to 0)
+	// rather than making one up — downstream treats zero as
+	// open/unknown.
+	// With a Judge, resolution subsumes verification: it searches every
+	// page head for each title and asks whether the title BEGINS the page,
+	// with extraction's guess as one candidate among the hits. That is
+	// verification with search, and it is what makes the extraction body
+	// window irrelevant to page accuracy (HAL-1367). Plain verification
+	// remains the fallback when resolution cannot run.
+	//
+	// A failed Judge request is not "no Judge". The generative verifier
+	// asks about extraction's printed page numbers, which are wrong for
+	// every leaf past the cover of a long filing, so falling to it after
+	// a transport failure zeroes the tree and looks like success
+	// (HAL-1369). With a Judge configured, resolution is retried once
+	// with a fresh budget; if it still fails, extraction's pages are
+	// kept as they are and the degradation is recorded on Usage.
+	if b.Judge != nil {
+		b.resolvePagesOrKeep(ctx, nodes, pages, tocPages, &usage)
+	} else {
+		b.verifyTitlesConcurrent(ctx, nodes, pages, concurrency, &usage)
+	}
+
+	clock, calls = usage.phase("resolve", clock, calls)
+	b.end("resolve", "")
+	b.begin("split")
+
+	// Clear the starts that cannot be true (on the contents page, out
+	// of order, before the parent) before calibration, so the entries
+	// they belonged to are placed from their printed page numbers
+	// instead of keeping a wrong page.
+	cleared := repairStarts(nodes, tocPages)
+
+	// Leaves the resolver could not place get their printed page plus
+	// the offset the resolved leaves agree on.
+	if n := calibrateFromPrinted(nodes, printed, lastPage(pages)); n > 0 {
+		log.Printf("toc: %d leaves placed from printed page numbers", n)
+	}
+
+	// Calibration can be wrong too; check again what it placed.
+	if cleared += repairStarts(nodes, tocPages); cleared > 0 {
+		log.Printf("toc: %d impossible start pages cleared", cleared)
+	}
+
+	// Derive end pages from sibling order. Done last so verified
+	// start pages drive the derivation.
+	deriveEndPages(nodes, lastPage(pages))
+
+	// Split the leaves that are too big to cite or to read, at their
+	// own internal headings (HAL-1374). Needs the spans, so it runs
+	// after end pages; adds its own children's end pages.
+	splitDetail := "none over the limit"
+	if over := b.splitLeavesOver(); over > 0 {
+		if n := b.splitLargeLeaves(ctx, nodes, pages, over, &usage); n > 0 {
+			log.Printf("toc: %d sub-leaves added inside leaves over %d pages", n, over)
+			splitDetail = fmt.Sprintf("%d sub-sections", n)
+		}
+	} else {
+		splitDetail = "off"
+	}
+
+	usage.phase("split", clock, calls)
+	b.end("split", splitDetail)
+
+	// Stamp stable node IDs onto every node so callers / external
+	// consumers have an opaque handle independent of position.
+	stampNodeIDs(nodes, "")
+
+	return nodes, usage, nil
+}
+
+// resolverAttempts is how many times Build asks the Judge to resolve
+// pages before keeping extraction's. Two: the first failure is almost
+// always transport, and a resolver batch is two cheap requests.
+const resolverAttempts = 2
+
+// resolvePagesOrKeep runs Judge page resolution with one retry. On
+// exhaustion it leaves the tree exactly as extraction produced it and
+// records the fact; it never routes a Judge-path document through the
+// generative verifier.
+// defaultSplitLeavesOver: measured on FinanceBench, splitting at 8, 12
+// and 20 pages navigated alike (right section 40/40, evidence 36/40);
+// 20 makes the fewest sub-leaves and costs the least.
+const defaultSplitLeavesOver = 20
+
+func (b *TOCBuilder) splitLeavesOver() int {
+	switch {
+	case b.SplitLeavesOver < 0, b.Judge == nil:
+		return 0
+	case b.SplitLeavesOver == 0:
+		return defaultSplitLeavesOver
+	}
+	return b.SplitLeavesOver
+}
+
+func (b *TOCBuilder) resolvePagesOrKeep(ctx context.Context, nodes []tree.TOCNode, pages []PageText, exclude []int, usage *Usage) {
+	var lastErr error
+	for attempt := 1; attempt <= resolverAttempts; attempt++ {
+		resolved, handled, err := b.resolvePagesJudgeErr(ctx, nodes, pages, exclude, usage)
+		if err == nil {
+			if handled {
+				applyResolvedPages(nodes, resolved)
+			}
+			// handled=false with no error means there was nothing to
+			// resolve (no leaves with titles); extraction's pages stand.
+			return
+		}
+		lastErr = err
+		log.Printf("toc: judge page resolution attempt %d/%d failed: %v", attempt, resolverAttempts, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	usage.degrade("page resolution", fmt.Sprintf("kept extraction's pages after %d failed Judge attempts: %v", resolverAttempts, lastErr))
+}
+
+// detectTOCPages scans the first tocCheck pages with the
+// TreeWalk-style single-page detector. Returns the 1-indexed page
+// numbers (in order) the LLM judged as table-of-contents pages.
+//
+// Detection failures (transport / parse) silently fall back to
+// "no TOC found here" so the caller transitions to the no-TOC path.
+// This matches the TreeWalk contract — the no-TOC generator is
+// strictly more general than the TOC-extraction path.
+func (b *TOCBuilder) detectTOCPages(ctx context.Context, pages []PageText, tocCheck int, usage *Usage) []int {
+	limit := tocCheck
+	if limit > len(pages) {
+		limit = len(pages)
+	}
+	var found []int
+	for i := 0; i < limit; i++ {
+		if ctx.Err() != nil {
+			return found
+		}
+		page := pages[i]
+		text := strings.TrimSpace(page.Text)
+		if text == "" {
+			continue
+		}
+		isTOC, err := b.runTOCDetector(ctx, text, usage)
+		if err != nil {
+			// Transport / ErrNotImplemented — abandon detection and
+			// let the caller fall back to the no-TOC path.
+			return found
+		}
+		if isTOC {
+			found = append(found, page.PageNumber)
+		}
+	}
+	return found
+}
+
+// runTOCDetector asks the LLM whether the supplied page text reads
+// like a table of contents. Mirrors TreeWalk's
+// toc_detector_single_page.
+func (b *TOCBuilder) runTOCDetector(ctx context.Context, pageText string, usage *Usage) (bool, error) {
+	prompt := fmt.Sprintf(`Your job is to detect if there is a table of contents provided in the given text.
+
+Given text: %s
+
+return the following JSON format:
+{
+    "thinking": "<why do you think there is a table of contents in the given text>",
+    "toc_detected": "<yes or no>"
+}
+
+Directly return the final JSON structure. Do not output anything else.
+Please note: abstract, summary, notation list, figure list, table list, etc. are not tables of contents.`, truncate(pageText, tocDetectorMaxChars))
+
+	req := llmgate.Request{
+		Model:       b.Model,
+		Temperature: llmgate.Float64(0),
+		MaxTokens:   400,
+		Messages: []llmgate.Message{
+			{Role: llmgate.RoleSystem, Content: tocDetectorSystemPrompt},
+			{Role: llmgate.RoleUser, Content: prompt},
+		},
+		JSONMode:   true,
+		JSONSchema: []byte(tocDetectorJSONSchema),
+	}
+	raw, err := runTOCJSONWithRetry(ctx, b.LLM, req, defaultTOCRetries, usage, b.LLMCallTimeout)
+	if err != nil {
+		return false, err
+	}
+	if raw == "" {
+		return false, nil
+	}
+	var p tocDetectorPayload
+	if err := unmarshalLenient([]byte(raw), &p); err != nil {
+		return false, nil
+	}
+	return strings.EqualFold(strings.TrimSpace(p.TOCDetected), "yes"), nil
+}
+
+// extractFromTOCPages joins the detected TOC pages and asks the
+// LLM to parse them into structured nodes. The path used when a
+// TOC page was found — the structure on the page is the structure
+// the LLM is asked to reproduce, just with start_page resolved.
+//
+// On parse failure or transport blip, returns nil — the caller
+// degrades to an empty tree (still useful: the document remains
+// retrievable via the existing sections tree).
+func (b *TOCBuilder) extractFromTOCPages(ctx context.Context, pages []PageText, tocPages []int, usage *Usage) ([]tree.TOCNode, error) {
+	tocText := joinTOCPagesText(pages, tocPages)
+	bodyText := buildPhysicalIndexedText(pages, tocDetectorMaxChars*4)
+
+	prompt := fmt.Sprintf(`You are an expert in extracting hierarchical tree structure. Given a raw table-of-contents block and the document's body text (tagged with <physical_index_X> markers), produce the hierarchical TOC as a JSON array of nodes.
+
+For each node:
+- structure: dotted hierarchical index ("1", "1.1", "1.1.2") matching the heading depth.
+- title: the original section title, only fixing space inconsistency.
+- physical_index: the <physical_index_X> tag where the section begins. Look at the body text to resolve the page; if you cannot confidently locate it, use null.
+
+Raw table of contents:
+%s
+
+Body text (with <physical_index_X> markers):
+%s
+
+Return ONLY a JSON object: {"nodes": [{"structure": "1", "title": "...", "physical_index": "<physical_index_3>"}, ...]}. Do not output anything else.`,
+		truncate(tocText, tocExtractorMaxChars),
+		truncate(bodyText, tocExtractorMaxBody),
+	)
+
+	req := llmgate.Request{
+		Model:       b.Model,
+		Temperature: llmgate.Float64(0),
+		MaxTokens:   4096,
+		Messages: []llmgate.Message{
+			{Role: llmgate.RoleSystem, Content: tocExtractorSystemPrompt},
+			{Role: llmgate.RoleUser, Content: prompt},
+		},
+		JSONMode:   true,
+		JSONSchema: []byte(tocNodesJSONSchema),
+	}
+	raw, err := runTOCJSONWithRetry(ctx, b.LLM, req, defaultTOCRetries, usage, b.LLMCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	flat := parseTOCNodesPayload(raw)
+	return assembleHierarchy(flat), nil
+}
+
+// generateNoTOC is the TreeWalk-style process_no_toc driver: when
+// no TOC page was found, page content (tagged with
+// <physical_index_X> markers) is fed to the LLM with instructions
+// to emit a TOC straight from headings in the body.
+func (b *TOCBuilder) generateNoTOC(ctx context.Context, pages []PageText, usage *Usage) ([]tree.TOCNode, error) {
+	body := buildPhysicalIndexedText(pages, noTOCMaxBody)
+	prompt := fmt.Sprintf(`You are an expert in extracting hierarchical tree structure; your task is to generate the table-of-contents tree of the document below from its body text.
+
+The structure variable is the dotted hierarchical index ("1", "1.1", "1.1.2") representing the section's position in the outline.
+
+For the title, extract the original heading verbatim; only fix space inconsistency.
+
+The text contains <physical_index_X> markers indicating the start and end of page X. For each section's physical_index, return the <physical_index_X> tag where the section starts (keep the format).
+
+Body text:
+%s
+
+Return ONLY a JSON object: {"nodes": [{"structure": "1", "title": "...", "physical_index": "<physical_index_3>"}, ...]}. Do not output anything else.`, body)
+
+	req := llmgate.Request{
+		Model:       b.Model,
+		Temperature: llmgate.Float64(0),
+		MaxTokens:   4096,
+		Messages: []llmgate.Message{
+			{Role: llmgate.RoleSystem, Content: tocExtractorSystemPrompt},
+			{Role: llmgate.RoleUser, Content: prompt},
+		},
+		JSONMode:   true,
+		JSONSchema: []byte(tocNodesJSONSchema),
+	}
+	raw, err := runTOCJSONWithRetry(ctx, b.LLM, req, defaultTOCRetries, usage, b.LLMCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	flat := parseTOCNodesPayload(raw)
+	return assembleHierarchy(flat), nil
+}
+
+// verifyTitlesConcurrent runs TreeWalk's check_title_appearance_in_start
+// over every node whose StartPage is set, with bounded concurrency.
+// Mismatches set StartPage back to zero — the downstream contract
+// is "zero means unknown / open" — so a misclaimed page never
+// pretends to be authoritative.
+func (b *TOCBuilder) verifyTitlesConcurrent(ctx context.Context, nodes []tree.TOCNode, pages []PageText, concurrency int, usage *Usage) {
+	pageByNumber := indexByPage(pages)
+	flat := flattenForVerify(nodes)
+	if len(flat) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, concurrency)
+	g, gctx := errgroup.WithContext(ctx)
+	var (
+		mu       sync.Mutex
+		localUse Usage
+	)
+
+	type result struct {
+		node *tree.TOCNode
+		ok   bool
+	}
+	results := make([]result, len(flat))
+
+	for i, n := range flat {
+		i, n := i, n
+		if n.StartPage <= 0 {
+			continue
+		}
+		pageText, ok := pageByNumber[n.StartPage]
+		if !ok {
+			// claimed a page we don't have — clear it.
+			results[i] = result{node: n, ok: false}
+			continue
+		}
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-gctx.Done():
+				return nil
+			}
+			// Accumulate this call's usage into a goroutine-local Usage,
+			// then fold it into the shared total under the lock — passing
+			// &localUse directly would race (concurrent usage.add writes).
+			var u Usage
+			startsHere, err := b.runVerifyTitleAtPageStart(gctx, n.Title, pageText, &u)
+			mu.Lock()
+			localUse.InputTokens += u.InputTokens
+			localUse.OutputTokens += u.OutputTokens
+			localUse.TotalTokens += u.TotalTokens
+			localUse.CostUSD += u.CostUSD
+			localUse.LLMCalls += u.LLMCalls
+			mu.Unlock()
+			if err != nil {
+				// Transport / stub LLM — treat as "not verified" but
+				// don't clear the page; the LLM never weighed in.
+				results[i] = result{node: n, ok: true}
+				return nil
+			}
+			results[i] = result{node: n, ok: startsHere}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// Fold per-call usage into the caller's accumulator under the lock
+	// so concurrent additions stay coherent.
+	mu.Lock()
+	usage.InputTokens += localUse.InputTokens
+	usage.OutputTokens += localUse.OutputTokens
+	usage.TotalTokens += localUse.TotalTokens
+	usage.CostUSD += localUse.CostUSD
+	usage.LLMCalls += localUse.LLMCalls
+	mu.Unlock()
+
+	for _, r := range results {
+		if r.node == nil {
+			continue
+		}
+		if !r.ok {
+			r.node.StartPage = 0
+		}
+	}
+}
+
+// runVerifyTitleAtPageStart mirrors TreeWalk's
+// check_title_appearance_in_start: does this section's title appear
+// at the beginning of the supplied page?
+func (b *TOCBuilder) runVerifyTitleAtPageStart(ctx context.Context, title, pageText string, usage *Usage) (bool, error) {
+	prompt := fmt.Sprintf(`You will be given a section title and a page's text.
+Your job is to check if the section starts at the beginning of the given page text.
+If there are other contents before the section title, then the section does NOT start at the beginning of the page text.
+If the section title is the first meaningful content in the page text, then the section starts at the beginning.
+
+Note: do fuzzy matching; ignore space inconsistency.
+
+Section title: %s
+Page text: %s
+
+Reply format:
+{
+    "thinking": "<why you think the section appears or starts in the page text>",
+    "start_begin": "<yes or no>"
+}
+Directly return the final JSON structure. Do not output anything else.`, title, truncate(pageText, verifyMaxChars))
+
+	req := llmgate.Request{
+		Model:       b.Model,
+		Temperature: llmgate.Float64(0),
+		MaxTokens:   400,
+		Messages: []llmgate.Message{
+			{Role: llmgate.RoleSystem, Content: tocVerifySystemPrompt},
+			{Role: llmgate.RoleUser, Content: prompt},
+		},
+		JSONMode:   true,
+		JSONSchema: []byte(tocVerifyJSONSchema),
+	}
+	raw, err := runTOCJSONWithRetry(ctx, b.LLM, req, defaultTOCRetries, usage, b.LLMCallTimeout)
+	if err != nil {
+		return false, err
+	}
+	if raw == "" {
+		return false, nil
+	}
+	var p tocVerifyPayload
+	if err := unmarshalLenient([]byte(raw), &p); err != nil {
+		// Couldn't parse — keep the page (don't clear). The LLM had
+		// no clear say, so the safer move is "trust the extractor".
+		return true, nil
+	}
+	return strings.EqualFold(strings.TrimSpace(p.StartBegin), "yes"), nil
+}
+
+// --- prompt + schema constants ---
+
+const (
+	tocDetectorSystemPrompt  = "You are a precise document-structure analyser. Decide whether a single page of text is a table of contents."
+	tocExtractorSystemPrompt = "You are an expert in extracting hierarchical tree structures from documents. You output strict JSON only."
+	tocVerifySystemPrompt    = "You are a precise verifier. Decide whether a section title starts a page's text."
+	defaultTOCRetries        = 2
+	tocDetectorMaxChars      = 12000
+	tocExtractorMaxChars     = 16000
+	tocExtractorMaxBody      = 60000
+	noTOCMaxBody             = 80000
+	verifyMaxChars           = 4000
+	tocDetectorJSONSchema    = `{"type":"object","properties":{"thinking":{"type":"string"},"toc_detected":{"type":"string"}},"required":["toc_detected"]}`
+	tocVerifyJSONSchema      = `{"type":"object","properties":{"thinking":{"type":"string"},"start_begin":{"type":"string"}},"required":["start_begin"]}`
+	tocNodesJSONSchema       = `{"type":"object","properties":{"nodes":{"type":"array","items":{"type":"object","properties":{"structure":{"type":"string"},"title":{"type":"string"},"physical_index":{"type":["string","null"]}},"required":["title"]}}},"required":["nodes"]}`
+)
+
+// --- JSON payload types ---
+
+type tocDetectorPayload struct {
+	Thinking    string `json:"thinking"`
+	TOCDetected string `json:"toc_detected"`
+}
+
+type tocVerifyPayload struct {
+	Thinking   string `json:"thinking"`
+	StartBegin string `json:"start_begin"`
+}
+
+type tocNodePayload struct {
+	Structure     string  `json:"structure"`
+	Title         string  `json:"title"`
+	PhysicalIndex *string `json:"physical_index"`
+}
+
+type tocNodesPayload struct {
+	Nodes []tocNodePayload `json:"nodes"`
+}
+
+// --- shared helpers ---
+
+// runTOCJSONWithRetry runs a JSON-mode TOC LLM call, retrying up to
+// maxRetries additional times if the response can't be parsed.
+// Mirrors the runSelectionWithRetry contract from
+// pkg/retrieval/single_pass.go — copied here rather than imported
+// because the retrieval package owns its own per-domain version of
+// the same idea and we want the TOC builder to be importable by
+// any future consumer without dragging retrieval in.
+//
+// Returns the final raw response text (empty on transport / stub
+// failure). Caller decodes; a final parse failure degrades to "no
+// usable response" rather than an error.
+//
+// timeout bounds each individual Complete call. A per-call timeout (or
+// context cancellation) is terminal — it short-circuits the retry loop
+// rather than re-issuing a call that just hung. A non-positive timeout
+// disables the per-call bound.
+func runTOCJSONWithRetry(ctx context.Context, client llmgate.Client, baseReq llmgate.Request, maxRetries int, usage *Usage, timeout time.Duration) (string, error) {
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	var lastRaw string
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req := baseReq
+		if attempt > 0 {
+			msgs := make([]llmgate.Message, len(baseReq.Messages))
+			copy(msgs, baseReq.Messages)
+			tail := len(msgs) - 1
+			msgs[tail] = llmgate.Message{
+				Role:    msgs[tail].Role,
+				Content: msgs[tail].Content + "\n\nIMPORTANT: respond with ONLY a JSON object matching the schema. No prose, no markdown fences.",
+			}
+			req.Messages = msgs
+		}
+		resp, err := completeWithTimeout(ctx, client, req, timeout)
+		if err != nil {
+			// Stub LLM (ErrNotImplemented) is a soft failure — the
+			// caller will degrade. Transport errors and per-call
+			// timeouts do the same so ingest never dies on a transient
+			// blip or a hung call.
+			if errors.Is(err, llmgate.ErrNotImplemented) {
+				return "", nil
+			}
+			return "", err
+		}
+		usage.add(resp)
+		lastRaw = resp.Content
+		if looksLikeJSON(resp.Content) {
+			return resp.Content, nil
+		}
+	}
+	log.Printf("toc-builder: response did not parse after %d attempts; degrading to empty", maxRetries+1)
+	return lastRaw, nil
+}
+
+// looksLikeJSON is a cheap probe so the retry loop can stop once
+// the model returns something that at least textually resembles a
+// JSON object. The real parser may still reject — strict parsing
+// happens at the caller — but this avoids burning retries on
+// obvious non-JSON ("Sure, here is the TOC: ...").
+func looksLikeJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	return strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")
+}
+
+// unmarshalLenient strips code fences and any prose around the
+// first { / last } before decoding, matching the parser pattern
+// used in pkg/retrieval and pkg/ingest/summary_axes.go.
+func unmarshalLenient(raw []byte, dst any) error {
+	s := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(s, "```") {
+		if i := strings.Index(s, "\n"); i >= 0 {
+			s = s[i+1:]
+		}
+		s = strings.TrimSuffix(s, "```")
+		s = strings.TrimSpace(s)
+	}
+	if i := strings.Index(s, "{"); i > 0 {
+		s = s[i:]
+	}
+	if j := strings.LastIndex(s, "}"); j >= 0 && j < len(s)-1 {
+		s = s[:j+1]
+	}
+	return json.Unmarshal([]byte(s), dst)
+}
+
+// parseTOCNodesPayload decodes the raw nodes JSON. Returns an empty
+// slice on any parse failure — the builder caller treats "no
+// usable nodes" as "leave TOC NULL" and proceeds with ingest.
+func parseTOCNodesPayload(raw string) []tocNodePayload {
+	if raw == "" {
+		return nil
+	}
+	var p tocNodesPayload
+	if err := unmarshalLenient([]byte(raw), &p); err != nil {
+		return nil
+	}
+	return p.Nodes
+}
+
+// --- shape helpers ---
+
+// joinTOCPagesText collects the text of the supplied TOC pages, in
+// order, separated by newlines so the LLM sees them as one
+// coherent block.
+func joinTOCPagesText(pages []PageText, tocPages []int) string {
+	idx := indexByPage(pages)
+	var b strings.Builder
+	for _, p := range tocPages {
+		text, ok := idx[p]
+		if !ok || text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+// buildPhysicalIndexedText renders pages with <physical_index_X>
+// markers around each page's text — the literal format the LLM is
+// told to reproduce as the section's start page. budget caps the
+// total characters so we never blow past the model's context.
+func buildPhysicalIndexedText(pages []PageText, budget int) string {
+	var b strings.Builder
+	for _, p := range pages {
+		seg := fmt.Sprintf("<physical_index_%d>\n%s\n<physical_index_%d>\n\n", p.PageNumber, p.Text, p.PageNumber)
+		if budget > 0 && b.Len()+len(seg) > budget {
+			break
+		}
+		b.WriteString(seg)
+	}
+	return b.String()
+}
+
+// indexByPage returns a map of page number to page text.
+func indexByPage(pages []PageText) map[int]string {
+	out := make(map[int]string, len(pages))
+	for _, p := range pages {
+		out[p.PageNumber] = p.Text
+	}
+	return out
+}
+
+// lastPage returns the highest PageNumber in pages, or zero if
+// empty. Used as the default upper bound when deriving end pages.
+func lastPage(pages []PageText) int {
+	if len(pages) == 0 {
+		return 0
+	}
+	last := pages[0].PageNumber
+	for _, p := range pages[1:] {
+		if p.PageNumber > last {
+			last = p.PageNumber
+		}
+	}
+	return last
+}
+
+// truncate caps s at max characters, appending an ellipsis when
+// it had to cut. A non-positive max disables the cap.
+func truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// physicalIndexRE-like helper without regexp: parses the integer X
+// out of "<physical_index_X>". Returns 0 when the input doesn't
+// match — the verify phase treats zero as unknown.
+func parsePhysicalIndex(s string) int {
+	const prefix = "<physical_index_"
+	const suffix = ">"
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
+		return 0
+	}
+	mid := s[len(prefix) : len(s)-len(suffix)]
+	n := 0
+	for _, r := range mid {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// assembleHierarchy turns a flat list of TOC node payloads into a
+// nested tree based on the dotted structure ("1", "1.1", "1.1.2").
+// Missing intermediate parents are tolerated — orphans land at the
+// top level so a misnumbered LLM response doesn't drop nodes
+// silently.
+func assembleHierarchy(flat []tocNodePayload) []tree.TOCNode {
+	if len(flat) == 0 {
+		return nil
+	}
+	// First materialise every payload as a TOCNode with its claimed
+	// start page resolved.
+	nodes := make([]tree.TOCNode, 0, len(flat))
+	for _, n := range flat {
+		title := strings.TrimSpace(n.Title)
+		if title == "" {
+			continue
+		}
+		page := 0
+		if n.PhysicalIndex != nil {
+			page = parsePhysicalIndex(*n.PhysicalIndex)
+		}
+		nodes = append(nodes, tree.TOCNode{
+			Structure: strings.TrimSpace(n.Structure),
+			Title:     title,
+			StartPage: page,
+		})
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	// Build a sentinel root; nest by counting dots in Structure.
+	// "1" → depth 1, "1.2" → depth 2, "1.2.3" → depth 3.
+	type ref struct {
+		node      *tree.TOCNode
+		structure string
+	}
+	var (
+		out  []tree.TOCNode
+		path []ref
+	)
+	for i := range nodes {
+		n := &nodes[i]
+		depth := depthOf(n.Structure)
+		if depth <= 0 {
+			depth = 1
+		}
+		// Pop the path stack down to depth-1 so a "1.2" inserts
+		// under whatever last touched depth 1.
+		for len(path) >= depth {
+			path = path[:len(path)-1]
+		}
+		if len(path) == 0 {
+			out = append(out, *n)
+			path = append(path, ref{node: &out[len(out)-1], structure: n.Structure})
+			continue
+		}
+		parent := path[len(path)-1].node
+		parent.Nodes = append(parent.Nodes, *n)
+		path = append(path, ref{node: &parent.Nodes[len(parent.Nodes)-1], structure: n.Structure})
+	}
+	return out
+}
+
+// depthOf returns the depth implied by a dotted structure string
+// ("1" → 1, "1.2" → 2, "" → 0). A malformed structure ("1..2",
+// "a.b") still returns the number of dot-separated tokens — we'd
+// rather group than crash.
+func depthOf(structure string) int {
+	if structure == "" {
+		return 0
+	}
+	return strings.Count(structure, ".") + 1
+}
+
+// flattenForVerify returns pointers to every node in the tree in
+// depth-first pre-order so the verification phase can mutate
+// StartPage in place.
+func flattenForVerify(nodes []tree.TOCNode) []*tree.TOCNode {
+	var out []*tree.TOCNode
+	var walk func(ns []tree.TOCNode)
+	walk = func(ns []tree.TOCNode) {
+		for i := range ns {
+			out = append(out, &ns[i])
+			walk(ns[i].Nodes)
+		}
+	}
+	walk(nodes)
+	return out
+}
+
+// deriveEndPages walks the tree and fills each node's EndPage from
+// the next sibling at the same depth (StartPage - 1) or the
+// supplied docLastPage when no later sibling exists. Children's
+// end pages cap at their parent's, which is what readers expect
+// for a TOC.
+func deriveEndPages(nodes []tree.TOCNode, docLastPage int) {
+	inheritParentStarts(nodes)
+	deriveEndPagesIn(nodes, docLastPage)
+}
+
+// repairStarts clears start pages that cannot be true, so the end-page
+// derivation and the containers' inheritance fill them from what can:
+//
+//   - a section never begins on the contents page itself, or before its
+//     parent does;
+//   - siblings are listed in document order, so their starts must not go
+//     backwards. The largest set of siblings that is in order is kept and
+//     the rest are cleared: one entry placed far ahead must not take the
+//     correct ones after it down with it.
+//
+// Cleared means zero, the tree's "unknown" (HAL-2349: on the 3M 2018
+// 10-K, PART II and "Critical Accounting Estimates" were placed on the
+// contents page, which made PART I and Items 1B-4 run to page 128).
+// It returns how many starts it cleared.
+func repairStarts(nodes []tree.TOCNode, tocPages []int) int {
+	onTOC := make(map[int]bool, len(tocPages))
+	for _, p := range tocPages {
+		onTOC[p] = true
+	}
+	var walk func(ns []tree.TOCNode, floor int) int
+	walk = func(ns []tree.TOCNode, floor int) int {
+		cleared := 0
+		for i := range ns {
+			if p := ns[i].StartPage; p > 0 && (onTOC[p] || p < floor) {
+				why := "before its parent"
+				if onTOC[p] {
+					why = "on the contents page"
+				}
+				log.Printf("toc: cleared p.%d for %q (%s)", p, ns[i].Title, why)
+				ns[i].StartPage, ns[i].EndPage = 0, 0
+				cleared++
+			}
+		}
+		for _, i := range outOfOrder(ns) {
+			log.Printf("toc: cleared p.%d for %q (out of order)", ns[i].StartPage, ns[i].Title)
+			ns[i].StartPage, ns[i].EndPage = 0, 0
+			cleared++
+		}
+		for i := range ns {
+			childFloor := floor
+			if ns[i].StartPage > 0 {
+				childFloor = ns[i].StartPage
+			}
+			cleared += walk(ns[i].Nodes, childFloor)
+		}
+		return cleared
+	}
+	return walk(nodes, 0)
+}
+
+// outOfOrder returns the indexes of placed siblings outside the longest
+// run whose start pages never go backwards. Unplaced siblings (zero)
+// are ignored. Sibling lists are short, so the quadratic search is fine.
+func outOfOrder(ns []tree.TOCNode) []int {
+	var idx []int
+	for i, n := range ns {
+		if n.StartPage > 0 {
+			idx = append(idx, i)
+		}
+	}
+	if len(idx) < 2 {
+		return nil
+	}
+	length := make([]int, len(idx))
+	prev := make([]int, len(idx))
+	best := 0
+	for a := range idx {
+		length[a], prev[a] = 1, -1
+		for b := 0; b < a; b++ {
+			if ns[idx[b]].StartPage <= ns[idx[a]].StartPage && length[b]+1 > length[a] {
+				length[a], prev[a] = length[b]+1, b
+			}
+		}
+		if length[a] > length[best] {
+			best = a
+		}
+	}
+	keep := make(map[int]bool, length[best])
+	for a := best; a >= 0; a = prev[a] {
+		keep[idx[a]] = true
+	}
+	var out []int
+	for _, i := range idx {
+		if !keep[i] {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// inheritParentStarts gives a container with no page of its own — a
+// "PART II" whose only content is its items — the first page any of its
+// children start on. Without it the container has no EndPage, and every
+// child in the previous part that shares a start page with a sibling
+// falls through to the document's last page as its end (HAL-1367).
+func inheritParentStarts(nodes []tree.TOCNode) {
+	for i := range nodes {
+		n := &nodes[i]
+		if len(n.Nodes) == 0 {
+			continue
+		}
+		inheritParentStarts(n.Nodes)
+		if n.StartPage > 0 {
+			continue
+		}
+		for _, c := range n.Nodes {
+			if c.StartPage > 0 && (n.StartPage == 0 || c.StartPage < n.StartPage) {
+				n.StartPage = c.StartPage
+			}
+		}
+	}
+}
+
+func deriveEndPagesIn(nodes []tree.TOCNode, ceiling int) {
+	for i := range nodes {
+		n := &nodes[i]
+		// Find the next sibling's start page that is strictly
+		// greater than this one — that's our end. Skip sibling
+		// entries whose StartPage was cleared (zero) by
+		// verification so a single bad page doesn't sink the
+		// rest of the row.
+		end := 0
+		for j := i + 1; j < len(nodes); j++ {
+			next := nodes[j].StartPage
+			if next == 0 || n.StartPage == 0 {
+				continue
+			}
+			// The next placed sibling opens on this one's page: short
+			// items of a 10-K (1B, 2, 3, 4) routinely share one. This
+			// section is that page long; it must not run on to the
+			// parent's end.
+			if next == n.StartPage {
+				end = n.StartPage
+				break
+			}
+			if next > n.StartPage {
+				end = next - 1
+				break
+			}
+		}
+		if end <= 0 {
+			end = ceiling
+		}
+		// A section can never end before the page it starts on. When
+		// the next part opens on this section's own page — Item 9B
+		// and Item 10 of a 10-K routinely share one — the sibling
+		// arithmetic says "end on the page before"; the truth is the
+		// section is one page long.
+		if n.StartPage > 0 {
+			if end < n.StartPage {
+				end = n.StartPage
+			}
+			n.EndPage = end
+		}
+		// Recurse with the child ceiling = this node's EndPage (or
+		// the parent's ceiling if EndPage is unknown).
+		childCeiling := n.EndPage
+		if childCeiling == 0 {
+			childCeiling = ceiling
+		}
+		deriveEndPagesIn(n.Nodes, childCeiling)
+		// A container spans at least as far as its last child.
+		for _, c := range n.Nodes {
+			if c.EndPage > n.EndPage {
+				n.EndPage = c.EndPage
+			}
+		}
+	}
+}
+
+// stampNodeIDs assigns deterministic NodeIDs based on the dotted
+// structure (with a prefix), recursing into children. IDs are
+// stable across runs given the same structure, which is handy for
+// callers that diff trees across re-ingestions.
+func stampNodeIDs(nodes []tree.TOCNode, prefix string) {
+	for i := range nodes {
+		n := &nodes[i]
+		base := n.Structure
+		if base == "" {
+			base = fmt.Sprintf("n%d", i+1)
+		}
+		if prefix == "" {
+			n.NodeID = "toc_" + base
+		} else {
+			n.NodeID = prefix + "_" + base
+		}
+		stampNodeIDs(n.Nodes, n.NodeID)
+	}
+}
