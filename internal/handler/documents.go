@@ -1,0 +1,859 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/hallelx2/vectorless-engine/pkg/db"
+	"github.com/hallelx2/vectorless-engine/pkg/ingest"
+	"github.com/hallelx2/vectorless-engine/pkg/queue"
+	"github.com/hallelx2/vectorless-engine/pkg/storage"
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+)
+
+// DocumentsHandler implements the documents and sections API surface.
+type DocumentsHandler struct {
+	logger  *slog.Logger
+	db      *db.Pool
+	storage storage.Storage
+	queue   queue.Queue
+}
+
+// NewDocumentsHandler creates a DocumentsHandler.
+func NewDocumentsHandler(
+	logger *slog.Logger,
+	pool *db.Pool,
+	store storage.Storage,
+	q queue.Queue,
+) *DocumentsHandler {
+	return &DocumentsHandler{
+		logger:  logger,
+		db:      pool,
+		storage: store,
+		queue:   q,
+	}
+}
+
+// requireOrgID pulls the X-Vectorless-Org header (injected by the
+// control plane on every authenticated request) and writes a 400 if
+// it's missing. Returns the org id and true on success.
+func requireOrgID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	org := r.Header.Get("X-Vectorless-Org")
+	if org == "" {
+		writeErr(w, http.StatusBadRequest, "missing X-Vectorless-Org header")
+		return "", false
+	}
+	return org, true
+}
+
+// storeID pulls the optional X-Vectorless-Store header. Unlike org,
+// store is optional: an empty result means "don't scope by store"
+// (header-less / pre-stores callers see the whole org). The control
+// plane injects this once stores are wired.
+func storeID(r *http.Request) string {
+	return r.Header.Get("X-Vectorless-Store")
+}
+
+// HandleListDocuments returns a paginated list of documents for the
+// org identified by the X-Vectorless-Org header.
+//
+// Query params:
+//   - limit  — page size, clamped to [1, 200], default 50
+//   - status — optional filter by lifecycle status
+//   - cursor — RFC3339Nano timestamp from previous page's next_cursor
+func (h *DocumentsHandler) HandleListDocuments(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	opts := db.ListDocumentsOpts{
+		OrgID:   orgID,
+		StoreID: storeID(r),
+		Status:  db.DocumentStatus(q.Get("status")),
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			opts.Limit = n
+		}
+	}
+	if v := q.Get("cursor"); v != "" {
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			opts.Cursor = t
+		}
+	}
+
+	docs, next, err := h.db.ListDocuments(r.Context(), opts)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	ids := make([]tree.DocumentID, len(docs))
+	for i, d := range docs {
+		ids[i] = d.ID
+	}
+	counts, err := h.db.CountSectionsByDocument(r.Context(), ids)
+	if err != nil {
+		h.logger.Warn("documents: count sections", "err", err)
+		counts = map[tree.DocumentID]int{}
+	}
+	items := make([]map[string]any, 0, len(docs))
+	for _, doc := range docs {
+		item := map[string]any{
+			"doc_id":        doc.ID,
+			"id":            doc.ID,
+			"title":         doc.Title,
+			"content_type":  doc.ContentType,
+			"source_type":   sourceTypeFromContentType(doc.ContentType),
+			"status":        string(doc.Status),
+			"byte_size":     doc.ByteSize,
+			"section_count": counts[doc.ID],
+			"created_at":    doc.CreatedAt,
+			"updated_at":    doc.UpdatedAt,
+		}
+		// The verified structure, when ingest built one: how many nodes
+		// and how many pages it covers.
+		if n, pages := structureSize(doc.TOCTree); n > 0 {
+			item["structure_count"] = n
+			item["page_count"] = pages
+		}
+		items = append(items, item)
+	}
+	// Dashboard expects {documents, next_cursor, has_more}; the older
+	// {items} shape is kept as an alias for any SDK callers that
+	// already key off it.
+	resp := map[string]any{
+		"documents": items,
+		"items":     items,
+		"has_more":  !next.IsZero(),
+	}
+	if !next.IsZero() {
+		resp["next_cursor"] = next.Format(time.RFC3339Nano)
+	} else {
+		resp["next_cursor"] = nil
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// sanitizeTitle coerces a document title into a value safe for the
+// Postgres text column: valid UTF-8, no C0 control chars (except none —
+// titles are single-line), whitespace-collapsed and trimmed. Invalid
+// byte sequences (a client that mangled a non-ASCII char in the multipart
+// field) are dropped rather than replaced so the title stays clean. An
+// all-garbage title collapses to "" and the caller falls back to the doc id.
+func sanitizeTitle(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == utf8.RuneError {
+			continue
+		}
+		if r < 0x20 { // drop control chars incl. tab/newline — titles are one line
+			b.WriteRune(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(b.String(), " "))
+}
+
+// multiSpaceRe collapses runs of whitespace in a sanitized title.
+var multiSpaceRe = regexp.MustCompile(`\s{2,}`)
+
+// sourceTypeFromContentType collapses an HTTP Content-Type to the
+// short tag the dashboard's source-type badge expects.
+func sourceTypeFromContentType(ct string) string {
+	switch {
+	case strings.HasPrefix(ct, "application/pdf"):
+		return "pdf"
+	case strings.HasPrefix(ct, "text/markdown"):
+		return "markdown"
+	case strings.HasPrefix(ct, "text/plain"):
+		return "text"
+	case strings.HasPrefix(ct, "text/html"):
+		return "html"
+	case strings.HasPrefix(ct, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+		return "docx"
+	default:
+		return "file"
+	}
+}
+
+// HandleIngestDocument accepts a document via either multipart/form-data
+// (field name: "file") or JSON body {"content": "...", "filename": "..."}.
+// Returns 202 Accepted with the document_id in "pending" state.
+func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	docID := ingest.NewDocumentID()
+
+	// Idempotent ingest: if the client supplied an Idempotency-Key and we
+	// already have a document for this org under that key, return it instead
+	// of creating a duplicate. This makes a client/transport retry of the
+	// ingest POST (the HAL-323 duplicate-upload bug) a no-op.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" {
+		if existing, err := h.db.GetDocumentByIdempotencyKey(ctx, orgID, idemKey); err == nil {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"document_id": existing.ID,
+				"status":      string(existing.Status),
+			})
+			return
+		} else if !errors.Is(err, db.ErrNotFound) {
+			h.logger.Error("ingest: idempotency lookup failed", "err", err)
+			writeErr(w, http.StatusInternalServerError, "db read failed")
+			return
+		}
+	}
+
+	var (
+		filename      string
+		contentType   string
+		body          io.Reader
+		size          int64
+		titleOverride string
+		mode          string
+	)
+
+	ct := r.Header.Get("Content-Type")
+	switch {
+	case strings.HasPrefix(ct, "multipart/form-data"):
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid multipart body: "+err.Error())
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, `missing form field "file"`)
+			return
+		}
+		defer func() { _ = file.Close() }() // best-effort close
+		filename = header.Filename
+		contentType = header.Header.Get("Content-Type")
+		body = file
+		size = header.Size
+		// Optional multipart "title" field overrides the discovered title.
+		titleOverride = strings.TrimSpace(r.FormValue("title"))
+		mode = strings.TrimSpace(r.FormValue("mode"))
+
+	case strings.HasPrefix(ct, "application/json"):
+		var payload struct {
+			Filename    string `json:"filename"`
+			ContentType string `json:"content_type"`
+			Content     string `json:"content"`
+			URL         string `json:"url"`
+			Title       string `json:"title"`
+			Mode        string `json:"mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		mode = strings.TrimSpace(payload.Mode)
+		switch {
+		case payload.Content != "":
+			filename = payload.Filename
+			contentType = payload.ContentType
+			body = strings.NewReader(payload.Content)
+			size = int64(len(payload.Content))
+		case payload.URL != "":
+			// Fetched before the document row exists, so a bad URL is a
+			// 400 the caller sees now, not a failed document later.
+			b, name, ct, err := fetchDocument(ctx, payload.URL)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			filename, contentType = name, ct
+			if payload.Filename != "" {
+				filename = payload.Filename
+			}
+			if payload.ContentType != "" {
+				contentType = payload.ContentType
+			}
+			body = bytes.NewReader(b)
+			size = int64(len(b))
+		default:
+			writeErr(w, http.StatusBadRequest, `"content" or "url" is required`)
+			return
+		}
+		titleOverride = strings.TrimSpace(payload.Title)
+
+	default:
+		writeErr(w, http.StatusUnsupportedMediaType,
+			"use multipart/form-data (file) or application/json (content)")
+		return
+	}
+
+	if !ingest.ValidMode(mode) {
+		writeErr(w, http.StatusBadRequest, `"mode" must be "toc", "full" or "minimal"`)
+		return
+	}
+	// A server's generic type says nothing; the extension does.
+	if contentType == "" || contentType == "application/octet-stream" || contentType == "binary/octet-stream" {
+		contentType = guessContentType(filename)
+	}
+
+	key := ingest.SourceKey(docID, filename)
+	if err := h.storage.Put(ctx, key, body, storage.Metadata{
+		Key: key, Size: size, ContentType: contentType,
+	}); err != nil {
+		h.logger.Error("ingest: storage put failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "storage write failed")
+		return
+	}
+
+	title := titleOverride
+	if title == "" {
+		title = filename
+	}
+	// Sanitize before the DB write: a title with invalid UTF-8 bytes
+	// (e.g. a client that mangled an em-dash) would otherwise make the
+	// Postgres insert fail with "db write failed" and 500 the whole
+	// ingest. Coerce to valid UTF-8 and drop control chars so a bad
+	// title byte can never fail the upload.
+	title = sanitizeTitle(title)
+	if title == "" {
+		title = string(docID)
+	}
+
+	if err := h.db.NewDocument(ctx, db.Document{
+		ID:             docID,
+		OrgID:          orgID,
+		StoreID:        storeID(r),
+		Title:          title,
+		ContentType:    contentType,
+		SourceRef:      key,
+		Status:         db.StatusPending,
+		ByteSize:       size,
+		IdempotencyKey: idemKey,
+	}); err != nil {
+		// A concurrent request with the same Idempotency-Key won the race and
+		// inserted first. Drop the orphan source we just wrote and return the
+		// winner's document rather than a 500.
+		if idemKey != "" && errors.Is(err, db.ErrConflict) {
+			if delErr := h.storage.Delete(ctx, key); delErr != nil {
+				h.logger.Warn("ingest: orphan source cleanup failed", "err", delErr, "source_ref", key, "idempotency_key", idemKey)
+			}
+			if existing, lookupErr := h.db.GetDocumentByIdempotencyKey(ctx, orgID, idemKey); lookupErr == nil {
+				writeJSON(w, http.StatusAccepted, map[string]any{
+					"document_id": existing.ID,
+					"status":      string(existing.Status),
+				})
+				return
+			}
+		}
+		h.logger.Error("ingest: db insert failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "db write failed")
+		return
+	}
+
+	payload, _ := json.Marshal(ingest.Payload{
+		DocumentID:  docID,
+		ContentType: contentType,
+		Filename:    filename,
+		SourceRef:   key,
+		Title:       titleOverride,
+		Profile:     r.Header.Get("X-Vectorless-Profile"),
+		Mode:        mode,
+	})
+	if err := h.queue.Enqueue(ctx, queue.Job{
+		Kind:      queue.KindIngestDocument,
+		Payload:   payload,
+		DedupeKey: string(docID),
+	}); err != nil {
+		h.logger.Error("ingest: enqueue failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "enqueue failed")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"document_id": docID,
+		"status":      string(db.StatusPending),
+	})
+}
+
+// HandleGetDocument returns metadata and lifecycle status for one document.
+func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Section count is fire-and-forget — if it fails we still return
+	// the rest of the doc rather than failing the whole GET.
+	sectionCount := 0
+	if n, cerr := h.db.CountSections(r.Context(), id, orgID, storeID(r)); cerr == nil {
+		sectionCount = n
+	}
+	resp := map[string]any{
+		"doc_id":        doc.ID,
+		"id":            doc.ID,
+		"title":         doc.Title,
+		"content_type":  doc.ContentType,
+		"source_type":   sourceTypeFromContentType(doc.ContentType),
+		"status":        string(doc.Status),
+		"byte_size":     doc.ByteSize,
+		"section_count": sectionCount,
+		"error_message": doc.ErrorMessage,
+		"metadata":      doc.Metadata,
+		"created_at":    doc.CreatedAt,
+		"updated_at":    doc.UpdatedAt,
+	}
+	// Each ingest stage's state and timing, for the live pipeline view.
+	if len(doc.Progress) > 2 {
+		resp["progress"] = json.RawMessage(doc.Progress)
+	}
+	// The verified structure ingest built, when there is one; the
+	// dashboard shows it instead of the parser's raw section count.
+	if n, pages := structureSize(doc.TOCTree); n > 0 {
+		resp["structure_count"] = n
+		resp["page_count"] = pages
+		resp["structure_source"] = "toc"
+	} else {
+		resp["structure_source"] = "sections"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleDeleteDocument removes a document and cascades to its sections.
+func (h *DocumentsHandler) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	if err := h.db.DeleteDocument(r.Context(), id, orgID, storeID(r)); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	purgeDocument(r.Context(), h.logger, h.storage, id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleGetDocumentSource streams the original document bytes back to the
+// caller. The document's SourceRef points to its location in storage.
+func (h *DocumentsHandler) HandleGetDocumentSource(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if doc.SourceRef == "" {
+		writeErr(w, http.StatusNotFound, "document source not available")
+		return
+	}
+
+	rc, meta, err := h.storage.Get(r.Context(), doc.SourceRef)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read source: "+err.Error())
+		return
+	}
+	defer func() { _ = rc.Close() }() // best-effort close
+
+	ct := doc.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	if meta.Size > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.Size))
+	}
+	if doc.Title != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, doc.Title))
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc) // best-effort write to response
+}
+
+// HandleGetTree returns the compact tree view used for LLM reasoning.
+func (h *DocumentsHandler) HandleGetTree(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	t, err := h.db.LoadTree(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, t.BuildView())
+}
+
+// structureSize counts a stored table of contents' nodes and the last
+// page it reaches.
+func structureSize(raw []byte) (nodes, pages int) {
+	if len(raw) == 0 {
+		return 0, 0
+	}
+	var toc []tree.TOCNode
+	if json.Unmarshal(raw, &toc) != nil {
+		return 0, 0
+	}
+	var walk func([]tree.TOCNode)
+	walk = func(ns []tree.TOCNode) {
+		for _, n := range ns {
+			nodes++
+			pages = max(pages, n.StartPage, n.EndPage)
+			walk(n.Nodes)
+		}
+	}
+	walk(toc)
+	return nodes, pages
+}
+
+// structureNode is one node of a document's structure as the structure
+// explorer draws it: title, page span, and children.
+type structureNode struct {
+	ID        string          `json:"id"`
+	Structure string          `json:"structure,omitempty"`
+	Title     string          `json:"title"`
+	StartPage int             `json:"start_page,omitempty"`
+	EndPage   int             `json:"end_page,omitempty"`
+	Summary   string          `json:"summary,omitempty"`
+	SectionID string          `json:"section_id,omitempty"`
+	Nodes     []structureNode `json:"nodes,omitempty"`
+}
+
+// HandleGetStructure returns the document's structure with page spans:
+//
+//	{"document_id", "title", "source": "toc"|"sections", "page_count", "nodes": [...]}
+//
+// It is the table of contents ingest built and verified against the
+// pages (source "toc") when there is one, else the parser's section
+// tree with its page ranges (source "sections"). Open-ended end pages
+// are closed against the next sibling, so every node has a span.
+func (h *DocumentsHandler) HandleGetStructure(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		writeDocErr(w, err)
+		return
+	}
+	t, err := h.db.LoadTree(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		writeDocErr(w, err)
+		return
+	}
+	resp := map[string]any{"document_id": id, "title": doc.Title}
+
+	var toc []tree.TOCNode
+	if len(doc.TOCTree) > 0 && json.Unmarshal(doc.TOCTree, &toc) == nil && len(toc) > 0 {
+		last := 0
+		for _, n := range toc {
+			last = max(last, maxEnd(n))
+		}
+		if pages := maxSectionPage(t); pages > last {
+			last = pages
+		}
+		resp["source"] = "toc"
+		resp["page_count"] = last
+		resp["nodes"] = fromTOC(toc, last)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	last := maxSectionPage(t)
+	resp["source"] = "sections"
+	resp["page_count"] = last
+	var nodes []structureNode
+	if t != nil && t.Root != nil {
+		kids := t.Root.Children
+		if len(kids) == 0 {
+			kids = []*tree.Section{t.Root}
+		}
+		for _, c := range kids {
+			nodes = append(nodes, fromSection(c))
+		}
+	}
+	resp["nodes"] = nodes
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func maxEnd(n tree.TOCNode) int {
+	m := max(n.StartPage, n.EndPage)
+	for _, c := range n.Nodes {
+		m = max(m, maxEnd(c))
+	}
+	return m
+}
+
+func maxSectionPage(t *tree.Tree) int {
+	m := 0
+	if t == nil || t.Root == nil {
+		return 0
+	}
+	t.Root.Walk(func(s *tree.Section) bool {
+		m = max(m, s.PageEnd, s.PageStart)
+		return true
+	})
+	return m
+}
+
+// fromTOC converts TOC nodes, closing an open end page against the next
+// sibling's start (or the parent's end).
+func fromTOC(ns []tree.TOCNode, parentEnd int) []structureNode {
+	out := make([]structureNode, 0, len(ns))
+	for i, n := range ns {
+		end := n.EndPage
+		if end == 0 {
+			if i+1 < len(ns) && ns[i+1].StartPage > 0 {
+				end = max(n.StartPage, ns[i+1].StartPage-1)
+			} else {
+				end = parentEnd
+			}
+		}
+		out = append(out, structureNode{
+			ID: n.NodeID, Structure: n.Structure, Title: n.Title,
+			StartPage: n.StartPage, EndPage: end, Summary: n.Summary,
+			Nodes: fromTOC(n.Nodes, end),
+		})
+	}
+	return out
+}
+
+func fromSection(s *tree.Section) structureNode {
+	n := structureNode{ID: string(s.ID), Title: s.Title, StartPage: s.PageStart, EndPage: s.PageEnd, Summary: s.Summary, SectionID: string(s.ID)}
+	for _, c := range s.Children {
+		n.Nodes = append(n.Nodes, fromSection(c))
+	}
+	return n
+}
+
+// HandleGetLlmsTxt renders the document tree as an llms.txt Markdown map —
+// the navigable, LLM-friendly index of the document (H1 title, blockquote
+// summary, nested section headings with one-line summaries).
+func (h *DocumentsHandler) HandleGetLlmsTxt(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		writeDocErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+
+	// The verified contents, when ingest built them: each entry placed on
+	// its page and linked to that page range's text. The parser's section
+	// tree is the fallback; its leaf titles are often a line of body text.
+	var toc []tree.TOCNode
+	if len(doc.TOCTree) > 0 && json.Unmarshal(doc.TOCTree, &toc) == nil && len(toc) > 0 {
+		last := 0
+		for _, n := range toc {
+			last = max(last, maxEnd(n))
+		}
+		if pages, err := h.readPages(r.Context(), id); err == nil && len(pages) > 0 {
+			last = max(last, pages[len(pages)-1].PageNumber)
+		}
+		base := "/v1/documents/" + string(id) + "/text?pages="
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, tree.RenderTOCLLMSTxt(doc.Title, toc, last, func(from, to int) string {
+			return fmt.Sprintf("%s%d-%d", base, from, to)
+		}))
+		return
+	}
+	t, err := h.db.LoadTree(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		writeDocErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, t.RenderLLMSTxt())
+}
+
+// maxTextPages bounds one /text request, so a single call cannot ask for
+// a whole 500-page filing at once.
+const maxTextPages = 60
+
+// HandleGetText returns the text of a page range as Markdown, one
+// "## Page n" block per page: GET /v1/documents/{id}/text?pages=7-14
+// (or a single page, ?pages=7). It is what llms.txt entries link to.
+func (h *DocumentsHandler) HandleGetText(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	if _, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r)); err != nil {
+		writeDocErr(w, err)
+		return
+	}
+	from, to, err := parsePageRange(r.URL.Query().Get("pages"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if to-from+1 > maxTextPages {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("at most %d pages per request", maxTextPages))
+		return
+	}
+	pages, err := h.readPages(r.Context(), id)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "this document has no per-page text (only PDFs ingested in toc or full mode do)")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read pages: "+err.Error())
+		return
+	}
+	var b strings.Builder
+	for _, p := range pages {
+		if p.PageNumber < from || p.PageNumber > to {
+			continue
+		}
+		fmt.Fprintf(&b, "## Page %d\n\n%s\n\n", p.PageNumber, strings.TrimSpace(p.Text))
+	}
+	if b.Len() == 0 {
+		writeErr(w, http.StatusNotFound, fmt.Sprintf("no pages in %d-%d", from, to))
+		return
+	}
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	_, _ = io.WriteString(w, b.String())
+}
+
+// readPages loads the per-page text ingest stored beside the contents.
+func (h *DocumentsHandler) readPages(ctx context.Context, id tree.DocumentID) ([]ingest.PageText, error) {
+	rc, _, err := h.storage.Get(ctx, ingest.PagesKey(id))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	var pages []ingest.PageText
+	if err := json.NewDecoder(rc).Decode(&pages); err != nil {
+		return nil, err
+	}
+	return pages, nil
+}
+
+// parsePageRange reads "7-14" or "7" into an inclusive 1-based range.
+func parsePageRange(s string) (int, int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, errors.New(`pages is required, as "7" or "7-14"`)
+	}
+	a, b, found := strings.Cut(s, "-")
+	from, err := strconv.Atoi(strings.TrimSpace(a))
+	if err != nil || from < 1 {
+		return 0, 0, fmt.Errorf("bad page %q", a)
+	}
+	to := from
+	if found {
+		if to, err = strconv.Atoi(strings.TrimSpace(b)); err != nil || to < from {
+			return 0, 0, fmt.Errorf("bad page range %q", s)
+		}
+	}
+	return from, to, nil
+}
+
+// HandleGetSection returns a single section with full content from storage.
+func (h *DocumentsHandler) HandleGetSection(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.SectionID(chi.URLParam(r, "id"))
+	sec, err := h.db.GetSection(r.Context(), id, orgID, storeID(r))
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "section not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var content string
+	if sec.ContentRef != "" {
+		rc, _, getErr := h.storage.Get(r.Context(), sec.ContentRef)
+		if getErr == nil {
+			raw, _ := io.ReadAll(rc)
+			_ = rc.Close() // best-effort close
+			content = string(raw)
+		}
+	}
+
+	out := map[string]any{
+		"id":          sec.ID,
+		"document_id": sec.DocumentID,
+		"parent_id":   sec.ParentID,
+		"ordinal":     sec.Ordinal,
+		"depth":       sec.Depth,
+		"title":       sec.Title,
+		"summary":     sec.Summary,
+		"token_count": sec.TokenCount,
+		"metadata":    sec.Metadata,
+		"content":     content,
+	}
+	// Page spans are omitted for formats without pages, as the spec says.
+	if sec.PageStart > 0 {
+		out["page_start"] = sec.PageStart
+		out["page_end"] = max(sec.PageEnd, sec.PageStart)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// purgeDocument removes a deleted document's stored files: the upload, its
+// section texts, page text and rendered pages. The row is already gone, so a
+// storage failure is logged rather than undoing the delete.
+func purgeDocument(ctx context.Context, logger *slog.Logger, st storage.Storage, id tree.DocumentID) {
+	n, err := ingest.PurgeDocument(ctx, st, id)
+	if err != nil {
+		logger.Error("delete document: purge stored files", "doc_id", id, "removed", n, "err", err)
+		return
+	}
+	logger.Info("delete document: purged stored files", "doc_id", id, "removed", n)
+}
