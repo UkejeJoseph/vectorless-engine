@@ -1,0 +1,210 @@
+package retrieval
+
+import (
+	"context"
+	"time"
+
+	"github.com/hallelx2/vectorless-engine/pkg/cache"
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+)
+
+// Cached wraps any Strategy and caches its Select results in an LRU.
+//
+// Cache key = sha256(document_id || query || strategy_name || model_name).
+// The cached value is a copy of the whole Result, so a hit returns what
+// the strategy found: for a page strategy that includes the evidence
+// pages the answer and its pincites are built from. Caching only the
+// section IDs dropped them, and a repeated question came back with no
+// pincites (HAL-2846). The wrapping is intentionally transparent —
+// callers interact with the standard Strategy interface and don't know
+// caching is present.
+//
+// Cached also implements CostStrategy if the wrapped strategy does. On a
+// cache hit, CostUSD and LLMCalls are both zero (no LLM call was made).
+type Cached struct {
+	inner Strategy
+	cache cache.Cache
+	ttl   time.Duration
+}
+
+// Compile-time interface checks.
+var (
+	_ Strategy     = (*Cached)(nil)
+	_ CostStrategy = (*Cached)(nil)
+)
+
+// CachedConfig is the configuration for the caching wrapper.
+type CachedConfig struct {
+	// MaxEntries is the maximum number of cached retrieval results.
+	// Zero defaults to 1024.
+	MaxEntries int
+
+	// TTL is how long a cached result remains valid. Zero defaults to
+	// 10 minutes. Set to a shorter value for frequently re-ingested
+	// documents.
+	TTL time.Duration
+}
+
+// NewCached wraps inner with an LRU retrieval cache.
+func NewCached(inner Strategy, cfg CachedConfig) *Cached {
+	if cfg.TTL == 0 {
+		cfg.TTL = 10 * time.Minute
+	}
+	return &Cached{
+		inner: inner,
+		cache: cache.NewLRU(cfg.MaxEntries),
+		ttl:   cfg.TTL,
+	}
+}
+
+// Name delegates to the inner strategy.
+func (c *Cached) Name() string { return c.inner.Name() }
+
+// Select checks the cache first. On a miss it delegates to the inner
+// strategy and caches the result.
+func (c *Cached) Select(ctx context.Context, t *tree.Tree, query string, budget ContextBudget) ([]tree.SectionID, error) {
+	// A strategy that reports a full Result is always cached through
+	// SelectWithCost, so no entry is ever an IDs-only stand-in that a
+	// later SelectWithCost hit would serve without its evidence pages.
+	if _, ok := c.inner.(CostStrategy); ok {
+		r, err := c.SelectWithCost(ctx, t, query, budget)
+		if err != nil {
+			return nil, err
+		}
+		return r.SelectedIDs, nil
+	}
+
+	key := cache.Key(string(t.DocumentID), query, c.inner.Name(), budget.ModelName)
+
+	if r, ok := c.get(key); ok {
+		return r.SelectedIDs, nil
+	}
+
+	ids, err := c.inner.Select(ctx, t, query, budget)
+	if err != nil {
+		return nil, err
+	}
+
+	c.cache.Set(key, cloneResult(&Result{SelectedIDs: ids}), c.ttl)
+	return append([]tree.SectionID(nil), ids...), nil
+}
+
+// SelectWithCost checks the cache first. On a hit it returns zero usage
+// (no LLM call was made). On a miss it delegates to the inner strategy's
+// SelectWithCost if available, otherwise falls back to Select.
+//
+// The replay trace token is preserved across cache hits: because the
+// token is a pure function of (document_id, doc_version, model, sorted
+// selected_ids) and the cache key already varies with document + model,
+// re-deriving the token from the cached slice produces the same value
+// the original strategy would have stamped.
+func (c *Cached) SelectWithCost(ctx context.Context, t *tree.Tree, query string, budget ContextBudget) (*Result, error) {
+	key := cache.Key(string(t.DocumentID), query, c.inner.Name(), budget.ModelName)
+
+	if r, ok := c.get(key); ok {
+		r.Reasoning = "cached"
+		r.Usage = Usage{} // zero — no LLM call
+		r.HopsTaken = 0   // and no navigation on this request
+		if r.ModelUsed == "" {
+			r.ModelUsed = budget.ModelName
+		}
+		if r.TraceToken == "" {
+			r.TraceToken = ComputeTraceToken(t.DocumentID, traceDocVersionV1, budget.ModelName, r.SelectedIDs)
+		}
+		return r, nil
+	}
+
+	var result *Result
+	if cs, ok := c.inner.(CostStrategy); ok {
+		var err error
+		result, err = cs.SelectWithCost(ctx, t, query, budget)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ids, err := c.inner.Select(ctx, t, query, budget)
+		if err != nil {
+			return nil, err
+		}
+		result = &Result{
+			SelectedIDs: ids,
+			TraceToken:  ComputeTraceToken(t.DocumentID, traceDocVersionV1, budget.ModelName, ids),
+		}
+	}
+
+	c.cache.Set(key, cloneResult(result), c.ttl)
+	return result, nil
+}
+
+// get returns a private copy of the cached Result for key, so a caller
+// that edits its result (the answer path trims evidence, for one) never
+// changes what the next hit sees.
+func (c *Cached) get(key string) (*Result, bool) {
+	v, ok := c.cache.Get(key)
+	if !ok {
+		return nil, false
+	}
+	r, ok := v.(*Result)
+	if !ok || r == nil {
+		return nil, false
+	}
+	return cloneResult(r), true
+}
+
+// cloneResult deep-copies the parts of a Result a caller could mutate:
+// its slices and map.
+func cloneResult(r *Result) *Result {
+	if r == nil {
+		return nil
+	}
+	out := *r
+	out.SelectedIDs = append([]tree.SectionID(nil), r.SelectedIDs...)
+	if r.Confidences != nil {
+		out.Confidences = make(map[tree.SectionID]float64, len(r.Confidences))
+		for k, v := range r.Confidences {
+			out.Confidences[k] = v
+		}
+	}
+	if r.PagesRead != nil {
+		out.PagesRead = make([]PageReadEntry, len(r.PagesRead))
+		for i, p := range r.PagesRead {
+			p.SectionIDs = append([]tree.SectionID(nil), p.SectionIDs...)
+			out.PagesRead[i] = p
+		}
+	}
+	out.EvidencePages = append([]EvidencePage(nil), r.EvidencePages...)
+	out.CitedPages = append([][2]int(nil), r.CitedPages...)
+	return &out
+}
+
+// SelectStream delegates to the inner strategy's SelectStream if it
+// implements StreamStrategy. Streaming results are NOT cached because
+// the stream is consumed as events arrive; the non-streaming Select path
+// should be used when caching is desired.
+func (c *Cached) SelectStream(ctx context.Context, t *tree.Tree, query string, budget ContextBudget) <-chan StreamEvent {
+	if ss, ok := c.inner.(StreamStrategy); ok {
+		return ss.SelectStream(ctx, t, query, budget)
+	}
+	// If the inner strategy doesn't support streaming, return a channel
+	// with an error event so the caller discovers it immediately.
+	ch := make(chan StreamEvent, 1)
+	ch <- StreamEvent{
+		Type:    EventError,
+		Message: "inner strategy does not support streaming",
+	}
+	close(ch)
+	return ch
+}
+
+// CacheStats exposes the underlying cache metrics.
+func (c *Cached) CacheStats() cache.Stats {
+	return c.cache.Stats()
+}
+
+// InvalidateDocument removes all cached results for a document. This is
+// useful after re-ingest. Since cache keys are hashed, we can't delete by
+// prefix; instead we expose this as a signal for the caller to Clear if
+// needed. For single-document invalidation, the caller should track keys.
+func (c *Cached) InvalidateAll() {
+	c.cache.Clear()
+}
