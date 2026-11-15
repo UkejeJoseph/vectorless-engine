@@ -1,0 +1,50 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Start deliberately small. We'll tighten over time — revive,
+  # gocritic, and the rest come back on once the existing tree is
+  # swept clean. The linters enabled here are the ones where a finding
+  # almost always indicates a real bug.
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - bodyclose
+    - unconvert
+  settings:
+    errcheck:
+      # Idiomatic deferred Close() and Rollback() don't have a sensible
+      # recovery path — logging them would be more noise than signal.
+      # Exclude the usual offenders; anything else stays checked.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (github.com/hallelx2/vectorless-engine/pkg/queue.Queue).Close
+    misspell:
+      # "strat" is our abbreviation for "strategy" (variable + key names),
+      # not a misspelling of "start".
+      ignore-rules:
+        - strat
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/hallelx2/vectorless-engine
