@@ -1,0 +1,198 @@
+// Package retrieval selects which sections of a document are relevant to a
+// query by reasoning over the tree.
+//
+// The engine ships with two strategies:
+//
+//   - single-pass: small tree fits in one LLM call; the model picks section
+//     IDs directly.
+//   - chunked-tree: tree is split into context-budget-sized subtrees,
+//     reasoned over in parallel, then results merged.
+//
+// Additional strategies are a simple interface away. Each strategy shares
+// the same tree data model; only the reasoning loop differs.
+package retrieval
+
+import (
+	"context"
+
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+)
+
+// Strategy is the contract every retrieval strategy satisfies.
+type Strategy interface {
+	// Name is the stable identifier used in configuration and telemetry.
+	Name() string
+
+	// Select returns the section IDs the model judged relevant to query.
+	Select(ctx context.Context, t *tree.Tree, query string, budget ContextBudget) ([]tree.SectionID, error)
+}
+
+// ContextBudget bounds a single LLM call.
+//
+// The engine uses it to decide when a tree is small enough for a single-pass
+// strategy and, for chunked-tree, how aggressively to split.
+type ContextBudget struct {
+	// ModelName is the model that will be called. Informational; strategies
+	// use it for logging and model-aware behavior.
+	ModelName string
+
+	// MaxTokens is the full context window of the model.
+	MaxTokens int
+
+	// ReservedForPrompt is the budget reserved for the system prompt,
+	// user instructions, and response tokens — i.e. not available to the
+	// tree view itself.
+	ReservedForPrompt int
+
+	// MaxParallelCalls bounds fan-out when chunking is required.
+	MaxParallelCalls int
+}
+
+// Available computes how many tokens of tree view can fit in one call.
+func (b ContextBudget) Available() int {
+	v := b.MaxTokens - b.ReservedForPrompt
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+// Result is returned to the API layer. It includes not just IDs but the
+// reasoning trace and cost accounting when the strategy supports it.
+// StepStrategy is a strategy that can report its progress as it runs.
+type StepStrategy interface {
+	Strategy
+	WithSteps(onStep func(NavStep)) Strategy
+}
+
+type Result struct {
+	SelectedIDs []tree.SectionID `json:"selected_ids"`
+
+	// Confidences carries per-pick relevance confidence in [0.0, 1.0]
+	// when the selection LLM returned the new-shape response with
+	// explicit confidence scores. Keys are restricted to IDs present in
+	// SelectedIDs (post-filter / post-merge). Nil when no confidence
+	// signal was present — either the legacy response shape was used or
+	// the model did not populate any confidence value. The API layer's
+	// abstention check fires only when this map is non-empty (see
+	// internal/api.handleQuery / handleAnswer).
+	Confidences map[tree.SectionID]float64 `json:"confidences,omitempty"`
+
+	Reasoning string `json:"reasoning,omitempty"`
+	ModelUsed string `json:"model_used,omitempty"`
+	Usage     Usage  `json:"usage"`
+
+	// HopsTaken is the number of LLM turns the strategy issued to reach the
+	// final selection. Single-shot strategies set this to 1; iterative
+	// strategies (e.g. agentic) set it to the number of tool-using turns
+	// actually consumed, including the terminal "done" turn.
+	HopsTaken int `json:"hops_taken,omitempty"`
+
+	// TraceToken is the replay token computed by ComputeTraceToken over
+	// the inputs that determine selection (document ID + version,
+	// retrieval model, system prompt version, sorted selected IDs).
+	// Two retrieval runs with identical inputs produce the same token,
+	// regardless of reasoning path. Empty when the strategy did not
+	// populate it (e.g. tests, fallback paths).
+	TraceToken string `json:"trace_token,omitempty"`
+
+	// PagesRead records the page ranges the strategy actually fetched
+	// during navigation. Page-based strategies (e.g. treewalk)
+	// populate this; section-by-section strategies leave it nil.
+	// Useful for the API layer's reasoning-trace surfaces and for
+	// cost/coverage debugging: a 10-K answer that read pages 50-55 +
+	// 102-104 leaves a concrete page footprint behind.
+	PagesRead []PageReadEntry `json:"pages_read,omitempty"`
+
+	// EvidencePages are the pages a page-based strategy judged to hold
+	// the answer, with their text — the unit such a strategy actually
+	// found, returned as-is rather than mapped back to sections whose
+	// page attribution may be wrong (HAL-1390). Empty for section-based
+	// strategies.
+	EvidencePages []EvidencePage `json:"evidence_pages,omitempty"`
+
+	// RunnerUpPages are pages a page-based strategy read in full and
+	// ranked just below its evidence, best first. A response that has
+	// room after the evidence fills it from here rather than from
+	// sections the evidence already covers (HAL-3160).
+	RunnerUpPages []EvidencePage `json:"runner_up_pages,omitempty"`
+
+	// RunnerUpIDs are the leaves ranked just below the selected ones,
+	// best first, for strategies whose units are sections.
+	RunnerUpIDs []tree.SectionID `json:"runner_up_ids,omitempty"`
+
+	// CitedPages is the FINAL set of page ranges the answer commits
+	// to — the model's cited_pages after dedup and the confidence cap,
+	// NOT every page it read (that is PagesRead). Page-based strategies
+	// populate this; it is the authoritative input for building the
+	// response's citations[] so a confident single-pick answer surfaces
+	// ONE citation even when it skimmed several pages to find it. Nil
+	// when the answer cited nothing (refusal) or the run was hop-capped
+	// without a valid done — callers then fall back to PagesRead.
+	CitedPages [][2]int `json:"cited_pages,omitempty"`
+
+	// Confidence is the model's self-reported confidence in the answer
+	// as a whole, in [0,1], for page-based strategies that ask for it
+	// on the done action. Zero means unstated (the model didn't report
+	// one) — it is NOT a "definitely wrong" signal, and the API layer
+	// must not abstain on a zero here. Per-pick confidence for section
+	// strategies still lives in Confidences.
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+// EvidencePage is one page a page-based strategy returns as evidence.
+type EvidencePage struct {
+	Page       int     `json:"page"`
+	Title      string  `json:"title,omitempty"` // the section the page belongs to
+	Text       string  `json:"text"`
+	Confidence float64 `json:"confidence"`
+}
+
+// PageReadEntry is one get_pages tool call that materialised during a
+// page-based retrieval loop. StartPage and EndPage are inclusive,
+// 1-indexed. SectionIDs lists every section whose [PageStart,PageEnd]
+// overlapped the requested range. CharCount records the size of the
+// returned text after PageContentLimit clipping so cost reporting can
+// reflect bytes-on-the-wire, not bytes-requested.
+type PageReadEntry struct {
+	StartPage  int              `json:"start_page"`
+	EndPage    int              `json:"end_page"`
+	SectionIDs []tree.SectionID `json:"section_ids,omitempty"`
+	CharCount  int              `json:"char_count,omitempty"`
+}
+
+// Usage is the aggregated token + cost accounting across all LLM calls
+// made during a single retrieval run.
+type Usage struct {
+	// InputTokens is the total prompt tokens across all calls.
+	InputTokens int
+	// OutputTokens is the total completion tokens across all calls.
+	OutputTokens int
+	// TotalTokens is InputTokens + OutputTokens.
+	TotalTokens int
+	// CostUSD is the estimated cost in US dollars. 0 if unknown.
+	CostUSD float64
+	// LLMCalls is the number of LLM calls made.
+	LLMCalls int
+}
+
+// Add adds the token counts and cost from another Usage.
+func (u *Usage) Add(other Usage) {
+	u.InputTokens += other.InputTokens
+	u.OutputTokens += other.OutputTokens
+	u.TotalTokens += other.TotalTokens
+	u.CostUSD += other.CostUSD
+	u.LLMCalls += other.LLMCalls
+}
+
+// CostStrategy extends Strategy with a richer return value that
+// includes cost accounting. Strategies that support cost tracking
+// implement this interface in addition to Strategy. The server
+// checks for it at runtime via type assertion.
+type CostStrategy interface {
+	Strategy
+
+	// SelectWithCost works like Select but returns a full Result
+	// including token usage and cost.
+	SelectWithCost(ctx context.Context, t *tree.Tree, query string, budget ContextBudget) (*Result, error)
+}
