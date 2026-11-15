@@ -1,0 +1,1571 @@
+openapi: "3.1.0"
+info:
+  title: Vectorless API
+  description: |
+    Structure-preserving document retrieval API. Ingest documents, build
+    hierarchical trees, and query them using LLM-driven reasoning — no
+    embeddings, no chunks, no vectors.
+  version: "1.0.0"
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.vectorless.dev
+    description: Managed SaaS
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Documents
+    description: Document lifecycle — ingest, inspect, list, delete.
+  - name: Sections
+    description: Individual document sections.
+  - name: Query
+    description: Structure-aware retrieval.
+  - name: Health
+    description: Liveness and version.
+
+paths:
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      operationId: healthCheck
+      security: []
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /v1/version:
+    get:
+      tags: [Health]
+      summary: Build version
+      operationId: getVersion
+      security: []
+      responses:
+        "200":
+          description: Server build version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    example: "1.2.3"
+
+  /v1/documents:
+    get:
+      tags: [Documents]
+      summary: List documents
+      operationId: listDocuments
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          description: RFC 3339 timestamp from previous page's next_cursor
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, parsing, summarizing, ready, failed]
+      responses:
+        "200":
+          description: Paginated document list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Document"
+                  next_cursor:
+                    type: string
+
+    post:
+      tags: [Documents]
+      summary: Ingest a document
+      operationId: createDocument
+      description: |
+        Upload a document for ingestion. Accepts multipart/form-data
+        (field: "file") or JSON body with content. Returns immediately
+        with a document_id in "pending" state. The ingest pipeline runs
+        asynchronously: parse → build tree → summarize sections.
+
+        Pass an `Idempotency-Key` header to make ingestion idempotent: a
+        repeated request with the same key returns the original document
+        (and its current status) instead of creating a duplicate. Use this
+        to make a client/network retry of the upload safe.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Opaque client-chosen key, unique per document. Repeating a
+            request with the same key returns the existing document rather
+            than ingesting a duplicate.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Exactly one of `content` or `url`.
+              properties:
+                filename:
+                  type: string
+                  example: report.md
+                content_type:
+                  type: string
+                  example: text/markdown
+                content:
+                  type: string
+                  description: The document itself, as text.
+                url:
+                  type: string
+                  format: uri
+                  description: |
+                    An http(s) URL Vectorless downloads the document from
+                    (public addresses only, at most 100 MB, 5 redirects).
+                    A URL that cannot be fetched is a 400.
+                title:
+                  type: string
+                mode:
+                  $ref: "#/components/schemas/IngestMode"
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title:
+                  type: string
+                mode:
+                  $ref: "#/components/schemas/IngestMode"
+      responses:
+        "202":
+          description: Document accepted for ingestion
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id:
+                    type: string
+                  status:
+                    type: string
+                    example: pending
+
+  /v1/documents/{id}:
+    get:
+      tags: [Documents]
+      summary: Get document metadata
+      operationId: getDocument
+      parameters:
+        - $ref: "#/components/parameters/DocumentID"
+      responses:
+        "200":
+          description: Document metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Document"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [Documents]
+      summary: Delete a document
+      operationId: deleteDocument
+      parameters:
+        - $ref: "#/components/parameters/DocumentID"
+      responses:
+        "204":
+          description: Document deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/documents/{id}/tree:
+    get:
+      tags: [Documents]
+      summary: Get document tree
+      operationId: getDocumentTree
+      description: |
+        Returns the compact hierarchical tree view of a document.
+        This is the structure the retrieval strategy feeds to the LLM.
+      parameters:
+        - $ref: "#/components/parameters/DocumentID"
+      responses:
+        "200":
+          description: Document tree
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentTree"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/documents/{id}/pages:
+    get:
+      tags: [Documents]
+      summary: Page list with sizes, for pincite viewers
+      operationId: listDocumentPages
+      description: |
+        The document's pages and their sizes in PDF points, so a viewer
+        can lay every page out at the right aspect before any image
+        loads. Built from the PDF's own geometry on first request and
+        stored beside the document. Non-PDF documents return
+        `page_count: 0` — their citations are section-level.
+      parameters:
+        - $ref: "#/components/parameters/DocumentID"
+      responses:
+        "200":
+          description: Pages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string }
+                  page_count: { type: integer }
+                  images:
+                    type: boolean
+                    description: Whether this server can render page images (poppler's pdftoppm is installed).
+                  pages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        page: { type: integer }
+                        width: { type: number, description: PDF points }
+                        height: { type: number, description: PDF points }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/documents/{id}/pages/{n}/image:
+    get:
+      tags: [Documents]
+      summary: One page of the source PDF as a JPEG
+      operationId: getDocumentPageImage
+      description: |
+        Rendered once (at ingest, or on first view for documents
+        ingested before page images existed), stored, and served with
+        `Cache-Control: private, max-age=31536000, immutable` and an
+        ETag. A pincite's `regions` are fractions of this image.
+      parameters:
+        - $ref: "#/components/parameters/DocumentID"
+        - name: n
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Page image
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "304":
+          description: Not modified (If-None-Match matched)
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Page rendering is not available on this server
+
+  /v1/sections/{id}:
+    get:
+      tags: [Sections]
+      summary: Get a section with full content
+      operationId: getSection
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Section with content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Section"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/query:
+    post:
+      tags: [Query]
+      summary: Query a document
+      operationId: query
+      description: |
+        Runs the configured retrieval strategy (single-pass or
+        chunked-tree) against the document's tree. The LLM reasons
+        over the tree structure and returns the sections it judges
+        most relevant to the query.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/answer:
+    post:
+      tags: [Query]
+      summary: Quote-grounded answer (retrieval + span + synthesis)
+      operationId: answer
+      description: |
+        Single round-trip endpoint that runs retrieval, per-section
+        answer-span extraction, and a synthesis LLM call to return a
+        natural-language answer plus citations. Every citation
+        includes the cited section's ID, page range (when known), and
+        the verbatim quote the answer relies on.
+
+        This is the most regulator-defensible endpoint: the answer is
+        grounded in retrieved sections, and each claim carries a
+        replayable provenance trail.
+
+        **Pincites.** When the configured strategy returns evidence
+        pages, the answer is written from those pages with
+        an inline `[n]` marker on every claim, and each marker becomes a
+        pincite: the sentence on the cited page that states the claim
+        (selected from the page's own sentences — never written by a
+        model), located on the page from the PDF's word
+        positions and returned as normalised `regions`. Markers that
+        point at no evidence are stripped and counted in
+        `markers_stripped`. The `[n]` in the returned `answer` are
+        pincite ids.
+
+        **Streaming.** `stream: true` (or `?stream=true`) answers as
+        Server-Sent Events: `started`; one `step` per navigation stage
+        as it completes (`structure`, `sections`, `skim`, `read`,
+        `pages`, `follow`), each with the sections and pages it
+        concerns; `retrieved` (the evidence pages, before the answer is
+        written); then `answer` with the full response, or `error`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnswerRequest"
+      responses:
+        "200":
+          description: Synthesised answer with citations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnswerResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Endpoint not available — no LLM client configured
+
+  /v1/answer/treewalk:
+    post:
+      tags: [Query]
+      summary: TreeWalk-style page-based agentic answer
+      operationId: answerTreeWalk
+      description: |
+        Quote-grounded answer endpoint backed by the page-based
+        agentic strategy. The model navigates the document via a
+        three-tool loop:
+
+          1. get_document_structure() — returns the TOC tree
+             (titles + page ranges, no body text).
+          2. get_pages(start_page, end_page) — returns the
+             concatenated content of every section whose page
+             range overlaps the requested range.
+          3. done(answer, cited_pages, reasoning) — terminates
+             with the natural-language answer plus the inclusive
+             page ranges the answer relies on.
+
+        Unlike /v1/answer this endpoint runs no separate
+        synthesis call — the model produces the final answer
+        inside the done tool call. Citations are per-page-range
+        with answer-span quotes pulled from the cited content.
+
+        Differentiators:
+          - `trace_token` substrate is reused: the page-based
+            input set (sorted cited page ranges) is folded into
+            the same sha256 the per-section endpoints use, so
+            /v1/replay accepts page-index responses uniformly.
+          - `reasoning_trace` lists every tool call the agent
+            made, opt-in via body `reasoning:true` or query
+            `?reasoning=true`.
+          - Streaming (`stream:true`) returns Server-Sent
+            Events with one event per tool call.
+
+        Gracefully degrades when no LLM-built TOC tree has
+        been persisted for the document yet — the strategy
+        synthesises a TOC view from the section list rather
+        than failing the request.
+      parameters:
+        - name: reasoning
+          in: query
+          required: false
+          description: |
+            Alternative to the body's `reasoning` field. When set
+            to `true` the response carries a `reasoning_trace`
+            array describing every tool call.
+          schema:
+            type: boolean
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TreeWalkAnswerRequest"
+      responses:
+        "200":
+          description: |
+            Synthesised answer plus page-grounded citations. When
+            `stream` is `true`, the response is Server-Sent
+            Events (Content-Type `text/event-stream`) rather than
+            JSON; see the description for event types.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TreeWalkAnswerResponse"
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE event stream. Event types emitted in
+                  order: `started`, one event per tool call
+                  (`get_document_structure`, `get_pages`,
+                  `done`), and finally `answer` carrying the
+                  full TreeWalkAnswerResponse payload. On
+                  error a single `error` event is emitted.
+        "400":
+          description: Missing or invalid request body.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: |
+            Endpoint not available. Either the server has no LLM
+            client configured, or
+            `retrieval.treewalk.enabled=false`, or the
+            TreeWalkStrategy instance was not wired at boot.
+
+  /v1/replay:
+    post:
+      tags: [Query]
+      summary: Replay a prior response byte-for-byte
+      operationId: replay
+      description: |
+        Returns the exact bytes of a previously-served /v1/query or
+        /v1/answer response keyed by its `trace_token`. The trace
+        token is surfaced on every retrieval response and is a
+        sha256 over (document_id, doc_version, model, sorted
+        selected section IDs, system prompt version). The body must
+        echo the original `query` and `document_id` so the engine
+        can refuse replay attempts under drifting inputs.
+
+        Replay is the operational expression of the engine's
+        reproducibility guarantee: with only the trace token plus
+        the original inputs, an auditor can reconstruct the answer
+        an end-user actually saw, byte-for-byte, without storing
+        the full response themselves.
+
+        Opt out at the server level by setting
+        `retrieval.replay.enabled=false` (or
+        `VLE_RETRIEVAL_REPLAY_ENABLED=false`); the endpoint then
+        returns 501.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplayRequest"
+      responses:
+        "200":
+          description: |
+            Byte-identical original response. The body shape is whatever
+            /v1/query or /v1/answer originally returned.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/QueryResponse"
+                  - $ref: "#/components/schemas/AnswerResponse"
+        "400":
+          description: Missing or invalid request body.
+        "404":
+          description: |
+            Unknown trace_token — entry not found in the replay store
+            (never stored, evicted from the LRU, or past its TTL).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: trace_token not found
+        "409":
+          description: |
+            Input mismatch — the request's query and/or document_id
+            do not match the stored entry. The `details` field
+            identifies the specific drifting field so an auditor can
+            tell whether the query was tampered with vs. pointed at
+            the wrong document.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: input mismatch
+                  details:
+                    type: string
+                    example: document_id differs from original
+        "501":
+          description: Replay store disabled on this server.
+
+  /v1/query/stream:
+    post:
+      tags: [Query]
+      summary: Streaming query (SSE)
+      operationId: queryStream
+      description: |
+        Streaming variant of the query endpoint. Returns Server-Sent
+        Events as sections are identified, before the full strategy
+        run completes. Each event is a JSON object.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Static API key for self-hosted deployments.
+
+  parameters:
+    DocumentID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: document not found
+
+  schemas:
+    TimingWait:
+      type: object
+      description: One thing a request waited on.
+      properties:
+        calls: {type: integer, description: Calls that reached the network.}
+        attempts: {type: integer, description: HTTP requests, retries included.}
+        failed: {type: integer}
+        wait_ms: {type: number, description: Wall-clock time at least one call was outstanding.}
+        busy_ms: {type: number, description: Sum of call durations; above wait_ms when calls overlapped.}
+        first_byte_ms: {type: number, description: Sum over calls of time from going on the wire to the first response byte.}
+        first_byte_max_ms: {type: number}
+        local_ms: {type: number, description: Time calls spent in the engine before going on the wire (limiter queue, prompt building).}
+    Timing:
+      type: object
+      description: >-
+        Where this request's time went. engine_ms + waiting_ms == total_ms;
+        waiting_ms is the union of the categories' waits.
+      properties:
+        total_ms: {type: number}
+        engine_ms: {type: number, description: Time not spent waiting on any provider, the database or storage.}
+        waiting_ms: {type: number}
+        judge: {$ref: '#/components/schemas/TimingWait'}
+        answer_model: {$ref: '#/components/schemas/TimingWait'}
+        db: {$ref: '#/components/schemas/TimingWait'}
+        storage: {$ref: '#/components/schemas/TimingWait'}
+    IngestMode:
+      type: string
+      enum: [toc, full, minimal]
+      description: |
+        How much structure to build for this document; omitted = the
+        deployment default. `toc`: the document's own table of contents,
+        verified against its pages (seconds). `full`: that plus a written
+        summary of every section (minutes on long documents). `minimal`:
+        headings only, no model calls.
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        content_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, parsing, summarizing, ready, failed]
+        byte_size:
+          type: integer
+        error_message:
+          type: string
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    DocumentTree:
+      type: object
+      properties:
+        document_id:
+          type: string
+        title:
+          type: string
+        sections:
+          type: array
+          items:
+            $ref: "#/components/schemas/SectionView"
+
+    SectionView:
+      type: object
+      properties:
+        id:
+          type: string
+        parent_id:
+          type: string
+        depth:
+          type: integer
+        title:
+          type: string
+        summary:
+          type: string
+        summary_axes:
+          $ref: "#/components/schemas/SummaryAxes"
+        children:
+          type: array
+          items:
+            type: string
+        tokens:
+          type: integer
+
+    Section:
+      type: object
+      properties:
+        id:
+          type: string
+        document_id:
+          type: string
+        parent_id:
+          type: string
+        ordinal:
+          type: integer
+        depth:
+          type: integer
+        title:
+          type: string
+        summary:
+          type: string
+        summary_axes:
+          $ref: "#/components/schemas/SummaryAxes"
+        token_count:
+          type: integer
+        page_start:
+          type: integer
+          description: Inclusive first page covered by this section. Omitted for non-paginated formats.
+        page_end:
+          type: integer
+          description: Inclusive last page covered by this section. Omitted for non-paginated formats.
+        candidate_questions:
+          type: array
+          items:
+            type: string
+          description: HyDE-generated questions this section can answer. Omitted when not yet generated.
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        content:
+          type: string
+          description: Full section content from storage.
+
+    QueryRequest:
+      type: object
+      required: [document_id, query]
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+          description: Natural-language query.
+        model:
+          type: string
+          description: Override the LLM model used for retrieval.
+        max_tokens:
+          type: integer
+          default: 100000
+        reserved_for_prompt:
+          type: integer
+          default: 4000
+        max_parallel_calls:
+          type: integer
+          default: 8
+        max_sections:
+          type: integer
+          description: Cap on returned sections. 0 = no cap.
+        enable_planning:
+          type: boolean
+          description: |
+            Opt this request into the query planner. One short LLM call
+            runs before retrieval and returns a structured Plan
+            (intent, entities, expected document areas, multi-hop
+            flag, sub-questions). When the plan is multi-hop and
+            `retrieval.planning.decompose` is enabled on the server,
+            retrieval fans out one selection call per sub-question
+            and unions the results. Overrides the server's
+            `retrieval.planning.enabled` setting for this request only.
+        enable_rerank:
+          type: boolean
+          description: |
+            Opt this request into the Phase 2.3 content-aware re-rank
+            pass. After the retrieval strategy returns candidate
+            section IDs and the engine loads their content, one extra
+            LLM call scores each section (0-100) against the query and
+            sections are reordered descending by score. When
+            `retrieval.rerank.top_k` is set on the server, only the
+            top-k sections survive. Failures preserve the strategy's
+            original order — re-rank never drops sections. Overrides
+            the server's `retrieval.rerank.enabled` setting for this
+            request only.
+        enable_abstain:
+          type: boolean
+          description: |
+            Opt this request into the Phase 2.4 confidence-driven
+            abstention check. When the selection LLM returns per-pick
+            confidence scores and every score falls below
+            `retrieval.abstain.below`, the response is an abstention
+            (sections empty, abstained=true) rather than evidence the
+            engine itself is not confident is relevant. Abstention
+            requires explicit confidence signal — legacy-shape LLM
+            responses (no confidence) never trigger abstention.
+            Overrides the server's `retrieval.abstain.enabled`
+            setting for this request only.
+
+    QueryResponse:
+      type: object
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+        strategy:
+          type: string
+          enum: [single-pass, chunked-tree, agentic, treewalk]
+        model:
+          type: string
+        sections:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuerySection"
+          description: |
+            Empty when `abstained=true`. The engine refused to surface
+            sections it isn't confident answer the query.
+        plan:
+          $ref: "#/components/schemas/Plan"
+        elapsed_ms:
+          type: integer
+        timing:
+          $ref: "#/components/schemas/Timing"
+        trace_token:
+          type: string
+          description: |
+            Deterministic 64-char hex sha256 over the inputs that
+            determine this response (document_id, document version,
+            model, sorted final section IDs, system prompt version).
+            Pass this token to /v1/replay along with the original
+            `query` and `document_id` to retrieve the byte-identical
+            response. Empty when the server has
+            `retrieval.replay.enabled=false`, and omitted on
+            abstention responses (which have no retrieval result to
+            replay).
+        confidences:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Per-section confidence scores in [0.0, 1.0] returned by the
+            selection LLM, keyed by section_id. Only present when the
+            model returned the new-shape response with explicit
+            confidence values. Useful for downstream evaluators that
+            want to surface the engine's certainty alongside the
+            evidence.
+        abstained:
+          type: boolean
+          description: |
+            True when the engine refused to ground an answer in the
+            retrieved evidence because every candidate section scored
+            below `min_confidence_threshold`. When true, `sections`
+            is empty and `candidate_confidences` carries the actual
+            scores so the caller can decide whether to relax the
+            threshold and retry.
+        abstention_reason:
+          type: string
+          description: |
+            Human-readable explanation when `abstained=true`. Stable
+            string suitable for surfacing verbatim to end users.
+        min_confidence_threshold:
+          type: number
+          description: |
+            The `retrieval.abstain.below` value the engine compared
+            confidences against. Present only on abstention responses.
+        candidate_confidences:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Per-section confidence scores the selection LLM returned
+            for every candidate it considered, NOT just the final
+            picks. Surfaced only on abstention responses so callers
+            can see exactly why the engine refused.
+
+    QuerySection:
+      type: object
+      properties:
+        id:
+          type: string
+        parent_id:
+          type: string
+        title:
+          type: string
+        summary:
+          type: string
+        summary_axes:
+          $ref: "#/components/schemas/SummaryAxes"
+        token_count:
+          type: integer
+        page_start:
+          type: integer
+          description: Inclusive first page covered by this section. Omitted for non-paginated formats.
+        page_end:
+          type: integer
+          description: Inclusive last page covered by this section. Omitted for non-paginated formats.
+        candidate_questions:
+          type: array
+          items:
+            type: string
+          description: HyDE-generated questions this section can answer. Omitted when not yet generated.
+        content:
+          type: string
+          description: Full section content from storage.
+        answer_span:
+          $ref: "#/components/schemas/AnswerSpan"
+        score:
+          type: number
+          description: |
+            Re-rank relevance score on a 0-100 scale, populated only
+            when the request opted into the Phase 2.3 re-rank pass
+            (`enable_rerank`) or the server has
+            `retrieval.rerank.enabled=true`. Sections are returned
+            sorted descending by score. Omitted when no re-rank ran.
+
+    AnswerSpan:
+      type: object
+      description: |
+        Verbatim quote from the section judged most relevant to the
+        query, plus byte offsets back into the section's content.
+        Returned only when `retrieval.answer_span.enabled` is true.
+        When `start` and `end` are both -1 the model paraphrased
+        despite the verbatim-quote rule — the text is preserved but
+        the offsets are sentinel.
+      properties:
+        start:
+          type: integer
+        end:
+          type: integer
+        text:
+          type: string
+
+    SummaryAxes:
+      type: object
+      description: |
+        Phase 2.5 multi-axis structured summary. The summarizer
+        produces this object alongside the flat `summary` field;
+        `summary` continues to carry the one-line sentence (which is
+        the same string as `one_line` here) so older API consumers
+        keep working. Omitted on sections written before the Phase
+        2.5 schema migration; will arrive on every newly-ingested
+        section. Each list axis is also independently optional —
+        sections without proper-noun mentions or numeric values
+        leave the corresponding array empty.
+      properties:
+        topics:
+          type: array
+          items:
+            type: string
+          description: Lower-case, hyphenated topic keywords (e.g. `debt`, `long-term-obligations`).
+        entities:
+          type: array
+          items:
+            type: string
+          description: Proper-noun mentions extracted verbatim from the section (orgs, people, places, dates).
+        numbers:
+          type: array
+          items:
+            type: string
+          description: Standout numeric values with units as they appear (e.g. `$4.2B`, `2.8%`, `Q3 2024`).
+        one_line:
+          type: string
+          description: Human-readable sentence describing the section. Mirrors the flat `summary` field.
+
+    AnswerRequest:
+      type: object
+      required: [document_id, query]
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+        model:
+          type: string
+        max_tokens:
+          type: integer
+        reserved_for_prompt:
+          type: integer
+        max_parallel_calls:
+          type: integer
+        max_sections:
+          type: integer
+          description: Cap on sections fed into synthesis. Defaults to retrieval.answer.max_sections (5).
+        max_answer_tokens:
+          type: integer
+          description: Bound the synthesised answer length. Defaults to retrieval.answer.max_answer_tokens (1024; 2048 on the evidence-page path).
+        stream:
+          type: boolean
+          description: Answer as Server-Sent Events (started → retrieved → answer). Also accepted as ?stream=true.
+        enable_planning:
+          type: boolean
+          description: |
+            Opt this request into the query planner. See QueryRequest for
+            full semantics. When enabled, the synthesis prompt also sees
+            the planner's structured intent and entity hints, and the
+            response carries a top-level `plan` field.
+        enable_rerank:
+          type: boolean
+          description: |
+            Opt this request into the Phase 2.3 content-aware re-rank
+            pass. See QueryRequest.enable_rerank for full semantics.
+            When the pass runs, the synthesis prompt sees the
+            re-ranked top-k (capped by `retrieval.rerank.top_k`), and
+            each citation in the response carries a `score` field.
+        enable_abstain:
+          type: boolean
+          description: |
+            Opt this request into the Phase 2.4 confidence-driven
+            abstention check. See QueryRequest.enable_abstain for
+            full semantics. When abstention fires on /v1/answer the
+            synthesis call is skipped entirely; the response carries
+            a canonical refusal in `answer`, an empty `citations`
+            array, and `abstained=true`.
+
+    AnswerResponse:
+      type: object
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+        answer:
+          type: string
+          description: |
+            Natural-language answer grounded in the cited sections.
+            When `abstained=true` this is the canonical refusal
+            ("I cannot answer this question from the supplied
+            document.") rather than synthesised prose.
+        pincites:
+          type: array
+          items: { $ref: "#/components/schemas/Pincite" }
+          description: Evidence-page path only. One per marker in `answer`, in answer order.
+        evidence:
+          type: array
+          description: Evidence-page path only. The evidence pages, best first.
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              page: { type: integer }
+              title: { type: string }
+              confidence: { type: number }
+        markers_inline:
+          type: boolean
+          description: Whether the answer carries inline markers. False when the model wrote none; every evidence page is then still cited.
+        markers_stripped:
+          type: integer
+          description: Markers removed because they pointed at no evidence.
+        timings_ms:
+          type: object
+          description: Evidence-page path only. Wall-clock split.
+          properties:
+            retrieval: { type: integer }
+            answer: { type: integer }
+            pincites: { type: integer }
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/AnswerCitation"
+          description: |
+            Empty array when `abstained=true`.
+        strategy:
+          type: string
+        model:
+          type: string
+        usage:
+          type: object
+          properties:
+            input_tokens: {type: integer}
+            output_tokens: {type: integer}
+            total_tokens: {type: integer}
+            cost_usd: {type: number}
+            llm_calls: {type: integer}
+          description: |
+            On abstention this carries the planning + retrieval
+            tokens but no synthesis tokens — the engine skipped
+            the synthesis LLM call entirely.
+        plan:
+          $ref: "#/components/schemas/Plan"
+        elapsed_ms:
+          type: integer
+        timing:
+          $ref: "#/components/schemas/Timing"
+        trace_token:
+          type: string
+          description: |
+            Deterministic 64-char hex sha256 token over the inputs
+            that determine this answer (document_id, document
+            version, synthesis model, sorted citation section IDs,
+            system prompt version). Pass to /v1/replay with the
+            original `query` and `document_id` to fetch the
+            byte-identical response. Empty when the server has
+            `retrieval.replay.enabled=false`, and omitted on
+            abstention responses (which have no synthesis result to
+            replay).
+        confidences:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Per-section confidence scores in [0.0, 1.0] returned by
+            the selection LLM, keyed by section_id. Only present
+            when the model returned the new-shape response with
+            explicit confidence values.
+        abstained:
+          type: boolean
+          description: |
+            True when the engine refused to synthesise an answer
+            because every candidate section scored below
+            `min_confidence_threshold`. The synthesis LLM call is
+            skipped entirely; `answer` is the canonical refusal and
+            `citations` is empty.
+        abstention_reason:
+          type: string
+          description: |
+            Human-readable explanation when `abstained=true`.
+        min_confidence_threshold:
+          type: number
+          description: |
+            The `retrieval.abstain.below` value the engine compared
+            confidences against. Present only on abstention responses.
+        candidate_confidences:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Per-section confidence scores the selection LLM returned
+            for every candidate it considered. Surfaced only on
+            abstention responses so callers can see exactly why the
+            engine refused to synthesise.
+
+    Plan:
+      type: object
+      description: |
+        Structured understanding of the query produced by the Phase 2.1
+        planner. Returned only when the request opts in (per-request
+        `enable_planning` or server-side `retrieval.planning.enabled`).
+        Synthesis (in /v1/answer) reads `intent`, `entities`, and
+        `expected_doc_areas` as orientation hints. When `is_multi_hop`
+        is true and `retrieval.planning.decompose` is on, retrieval
+        fans out one selection call per `sub_questions[i]` and unions
+        the per-sub-question selections.
+      properties:
+        intent:
+          type: string
+          description: |
+            Short snake_case label for the query intent. Open-ended:
+            common values are `factual_lookup`, `comparison`, `summary`,
+            `definition`, `list`, `calculation`.
+        entities:
+          type: array
+          items:
+            type: string
+          description: |
+            Salient proper nouns, dates, numbers, or specific terms the
+            query hinges on. Surfaced to the synthesis model for
+            orientation.
+        expected_doc_areas:
+          type: array
+          items:
+            type: string
+          description: |
+            Hints about which parts of a document are likely to hold the
+            answer (e.g. "balance sheet", "risk factors"). Empty when
+            no strong prior exists.
+        is_multi_hop:
+          type: boolean
+          description: |
+            True only when the query requires answering distinct
+            sub-questions whose answers must be combined.
+        sub_questions:
+          type: array
+          items:
+            type: string
+          description: |
+            Focused sub-questions the decomposer dispatches one-at-a-time.
+            Populated only when `is_multi_hop` is true.
+
+    AnswerCitation:
+      type: object
+      description: |
+        One citation behind the synthesised answer. `quote` is the
+        verbatim span the answer relies on (when the span extractor
+        found one). `quote_start`/`quote_end` give byte offsets into
+        the source section's content. `page_start`/`page_end` are the
+        section's page range — omitted for non-paginated formats.
+        `score` carries the re-rank relevance score on a 0-100 scale,
+        present only when the request opted into the Phase 2.3
+        re-rank pass.
+      properties:
+        section_id:
+          type: string
+        title:
+          type: string
+        quote:
+          type: string
+        quote_start:
+          type: integer
+        quote_end:
+          type: integer
+        page_start:
+          type: integer
+        page_end:
+          type: integer
+        index:
+          type: integer
+          description: Evidence-page path only. The evidence number the answer's markers cited.
+        page:
+          type: integer
+          description: Evidence-page path only. The page the regions sit on.
+        start_page:
+          type: integer
+        end_page:
+          type: integer
+        confidence:
+          type: number
+          description: Evidence-page path only. Probability that this page holds the answer.
+        section_ids:
+          type: array
+          items: { type: string }
+        regions:
+          type: array
+          items: { $ref: "#/components/schemas/PinciteRegion" }
+        precision:
+          type: string
+          enum: [line, page, section]
+        pincites:
+          type: array
+          items: { type: integer }
+          description: Ids of the pincites that cite this page.
+        score:
+          type: number
+          description: |
+            Re-rank relevance score on a 0-100 scale. Omitted when no
+            re-rank ran. Higher means the section is more directly
+            relevant to the query.
+
+    TreeWalkAnswerRequest:
+      type: object
+      description: |
+        Body for POST /v1/answer/treewalk. The endpoint exposes
+        per-request overrides for the page-based loop's caps
+        (max_hops, max_pages_per_fetch) alongside the standard
+        document_id / query / model fields.
+      required: [document_id, query]
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+          description: Natural-language query.
+        model:
+          type: string
+          description: |
+            Override the LLM model used by the navigation loop.
+            Falls back to `retrieval.treewalk.model`, then to the
+            engine's default model.
+        max_hops:
+          type: integer
+          description: |
+            Cap on the number of LLM turns the loop consumes,
+            counting the terminal `done` turn. Overrides
+            `retrieval.treewalk.max_hops` for this request only.
+            Default at the server level is 8.
+        max_pages_per_fetch:
+          type: integer
+          description: |
+            Cap on the characters one `get_pages` tool call may
+            return. Keeps a stray full-document fetch from
+            torching the model's context window. Overrides
+            `retrieval.treewalk.page_content_limit`. Default
+            16000.
+        stream:
+          type: boolean
+          description: |
+            When true, the response is Server-Sent Events: one
+            event per tool call (get_document_structure /
+            get_pages / done) followed by a terminal `answer`
+            event carrying the full TreeWalkAnswerResponse
+            payload. Lets the caller WATCH the agent navigate
+            in real time rather than waiting for the final
+            answer.
+        reasoning:
+          type: boolean
+          description: |
+            When true, the response carries a `reasoning_trace`
+            array describing every tool call the agent made
+            (hop, tool tag, args, optional sections-touched and
+            result-chars metadata). Equivalent to the
+            `?reasoning=true` query parameter.
+
+    TreeWalkAnswerResponse:
+      type: object
+      description: |
+        Non-streaming response shape. The `answer` field carries
+        the agent's natural-language reply produced inside the
+        terminal `done` tool call (no separate synthesis call).
+        Citations are per-page-range (not per-section) with
+        answer-span quotes pulled from the cited content.
+      properties:
+        document_id:
+          type: string
+        query:
+          type: string
+        answer:
+          type: string
+          description: |
+            Natural-language answer the agent emitted inside its
+            terminal `done` tool call. Empty when the loop hit
+            max_hops without the model finalising — callers
+            should fall through to a manual /v1/query or retry.
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/TreeWalkCitation"
+        strategy:
+          type: string
+          enum: [treewalk]
+        model:
+          type: string
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: |
+            The agent's self-reported confidence in the answer +
+            citation set, in [0,1], taken from the terminal `done`
+            tool call. 0 means the model did not report one (it is
+            NOT a "definitely wrong" signal). Surfaced so callers
+            can treat a low-confidence answer more cautiously; it
+            does not suppress the answer — even an unsure agent
+            still returns its single best citation rather than a
+            spray of hedged ones.
+        hops_taken:
+          type: integer
+          description: |
+            Number of LLM turns the loop consumed, counting any
+            forced terminal turn fired when max_hops was hit.
+        usage:
+          type: object
+          properties:
+            input_tokens: {type: integer}
+            output_tokens: {type: integer}
+            total_tokens: {type: integer}
+            cost_usd: {type: number}
+            llm_calls: {type: integer}
+        elapsed_ms:
+          type: integer
+        timing:
+          $ref: "#/components/schemas/Timing"
+        trace_token:
+          type: string
+          description: |
+            Deterministic 64-char hex sha256 token over the
+            document, system-prompt version, "treewalk:" model
+            tag, and sorted cited page ranges (e.g. ["1-2","5-7"]).
+            Two runs that cite the same pages — even via
+            different navigation paths — collapse to the same
+            token. Pass to /v1/replay with the original `query`
+            and `document_id` to fetch the byte-identical
+            response.
+        pages_read:
+          type: array
+          items:
+            $ref: "#/components/schemas/PageReadEntry"
+          description: |
+            Every `get_pages` invocation the loop made,
+            including ones whose ranges the model did not end
+            up citing. Useful for cost debugging and for
+            building a "navigation timeline" UI.
+        reasoning_trace:
+          type: array
+          items:
+            $ref: "#/components/schemas/TreeWalkTraceEntry"
+          description: |
+            Per-hop tool calls + arg summaries. Present only
+            when the request opted in via `reasoning:true` or
+            `?reasoning=true`.
+
+    TreeWalkCitation:
+      type: object
+      description: |
+        One citation behind the agent's answer. The pages
+        identify the cited range; `section_ids` lists every
+        section whose page range overlaps it; `quote` is the
+        verbatim answer-span the extractor judged most
+        relevant. When the extractor finds nothing in the
+        cited content the `quote` field is omitted (no
+        sentinel: absent means absent).
+      properties:
+        start_page:
+          type: integer
+          description: Inclusive first page in the citation.
+        end_page:
+          type: integer
+          description: Inclusive last page in the citation.
+        section_ids:
+          type: array
+          items:
+            type: string
+          description: |
+            Every section whose [page_start,page_end] overlaps
+            this citation, in document order.
+        quote:
+          type: string
+          description: |
+            Verbatim quote from the cited content judged most
+            relevant to the query. Omitted when no quote was
+            extracted (e.g. extractor returned nothing).
+        quote_start:
+          type: integer
+          description: |
+            Byte offset of the quote in the concatenated cited
+            content. -1 when the extractor returned a quote but
+            could not locate it verbatim (typically a
+            paraphrase).
+        quote_end:
+          type: integer
+        page:
+          type: integer
+          description: The page the quote was located on.
+        regions:
+          type: array
+          items: { $ref: "#/components/schemas/PinciteRegion" }
+          description: Where the quote sits on `page`. Empty unless `precision` is `line`.
+        precision:
+          type: string
+          enum: [line, page, section]
+          description: |
+            How exactly the citation is placed. `line` — the quote was
+            found and `regions` cover its words; `page` — the page is
+            known, the quote could not be placed; `section` — the source
+            has no pages (non-PDF).
+
+    PinciteRegion:
+      type: object
+      description: A rectangle on a page in 0..1 fractions of its width and height, origin top-left.
+      properties:
+        left: { type: number }
+        top: { type: number }
+        width: { type: number }
+        height: { type: number }
+        precision:
+          type: string
+          enum: [line, page, section]
+
+    Pincite:
+      type: object
+      description: One claim in the answer bound to the region of the page it rests on.
+      properties:
+        id: { type: integer, description: The marker number in `answer`. }
+        citation: { type: integer, description: The evidence number this claim cited. }
+        page: { type: integer }
+        claim: { type: string, description: The answer sentence the marker sits in. }
+        quote: { type: string, description: The page's own sentence that states the claim. Empty when none does. }
+        regions:
+          type: array
+          items: { $ref: "#/components/schemas/PinciteRegion" }
+        precision: { type: string, enum: [line, page, section] }
+        selected_by: { type: string, enum: [model, overlap], description: "How the sentence was selected: by model, or by word overlap when no model was available." }
+        selection_confidence: { type: number, description: "Probability for the selected sentence, when selected by model." }
+
+    PageReadEntry:
+      type: object
+      description: |
+        One `get_pages` call the agent made during navigation.
+        Surfaces what the model actually fetched (sections
+        touched + char count) rather than what it cited, so a
+        reviewer can audit the full evidence cone.
+      properties:
+        start_page:
+          type: integer
+        end_page:
+          type: integer
+        section_ids:
+          type: array
+          items:
+            type: string
+        char_count:
+          type: integer
+          description: |
+            Number of characters returned to the model after
+            clipping at `page_content_limit`. Bytes-on-the-wire,
+            not bytes-requested.
+
+    TreeWalkTraceEntry:
+      type: object
+      description: |
+        One tool call in the navigation timeline. Lets a
+        reviewer watch the agent's reasoning without paying for
+        a full streaming connection.
+      properties:
+        hop:
+          type: integer
+          description: 1-indexed turn number.
+        tool:
+          type: string
+          enum: [get_document_structure, get_pages, done]
+        reasoning:
+          type: string
+          description: |
+            One-sentence rationale the agent emitted alongside
+            the tool call. Populated only when the model
+            actually filled the `reasoning` field on the call.
+        args:
+          type: object
+          description: |
+            Tool-specific arguments. For `get_pages`,
+            `start_page` and `end_page`; for `done`,
+            `cited_pages`. Omitted for `get_document_structure`
+            (no args).
+        result_chars:
+          type: integer
+          description: |
+            Number of characters the tool result returned.
+            Populated for `get_pages` and (when present)
+            `get_document_structure`.
+        sections_touched:
+          type: array
+          items:
+            type: string
+          description: |
+            Section IDs the `get_pages` call materialised
+            content from.
+        answer:
+          type: string
+          description: |
+            The agent's final-turn answer string. Present only
+            on the terminal `done` entry; mirrors the
+            top-level `answer` field for debuggers reading the
+            trace.
+        note:
+          type: string
+          description: |
+            Optional human-readable note (e.g. "invalid range"
+            when the model asked for pages past the document's
+            end).
+
+    ReplayRequest:
+      type: object
+      description: |
+        Request body for POST /v1/replay. All three fields are
+        required: the trace_token identifies the stored response,
+        the query + document_id are validated against the stored
+        inputs so the engine rejects replay attempts under drifting
+        inputs (returns 409 with a `details` field identifying the
+        first drifting field).
+      required: [trace_token, query, document_id]
+      properties:
+        trace_token:
+          type: string
+          description: |
+            64-char hex sha256 trace token surfaced on the original
+            /v1/query or /v1/answer response.
+        query:
+          type: string
+          description: The user query the original request carried.
+        document_id:
+          type: string
+          description: The document the original request targeted.
