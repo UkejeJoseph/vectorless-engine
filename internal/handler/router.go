@@ -1,0 +1,302 @@
+package handler
+
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/hallelx2/vectorless-engine/pkg/reqtiming"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/hallelx2/llmgate"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	enginecfg "github.com/hallelx2/vectorless-engine/pkg/config"
+	"github.com/hallelx2/vectorless-engine/pkg/db"
+	"github.com/hallelx2/vectorless-engine/pkg/models"
+	"github.com/hallelx2/vectorless-engine/pkg/pincite"
+	"github.com/hallelx2/vectorless-engine/pkg/queue"
+	"github.com/hallelx2/vectorless-engine/pkg/retrieval"
+	"github.com/hallelx2/vectorless-engine/pkg/storage"
+
+	"github.com/hallelx2/vectorless-engine/gen/vectorless/v1/vectorlessv1connect"
+	"github.com/hallelx2/vectorless-engine/internal/config"
+	"github.com/hallelx2/vectorless-engine/internal/connecthandler"
+	"github.com/hallelx2/vectorless-engine/internal/middleware"
+)
+
+// Deps bundles the server's runtime dependencies for injection.
+type Deps struct {
+	Logger   *slog.Logger
+	DB       *db.Pool
+	Storage  storage.Storage
+	Queue    queue.Queue
+	Strategy retrieval.Strategy
+	MultiDoc *retrieval.MultiDoc
+	Version  string
+
+	// CorpusLibrary and CorpusNavigator serve corpus mode (HAL-3075):
+	// /v1/query/corpus and /v1/answer/corpus. A nil library makes both
+	// answer 501.
+	CorpusLibrary   *retrieval.CorpusLibrary
+	CorpusNavigator retrieval.CorpusNavigator
+	Config          config.Config
+
+	// Strategies is the pre-built set of selectable retrieval
+	// strategies keyed by config name. It backs the per-request
+	// "strategy" override on /v1/query (the benchmark uses it to A/B
+	// chunked-tree vs treewalk against one running engine). Nil
+	// disables the override — every /v1/query uses Strategy.
+	Strategies map[string]retrieval.Strategy
+
+	// LLM is the shared llmgate client used by the answer endpoints
+	// (/v1/answer, /v1/answer/treewalk) for span extraction and
+	// synthesis. Nil makes those endpoints return 501.
+	LLM llmgate.Client
+
+	// LLMModel is the default model name. Per-request model overrides
+	// win over it.
+	LLMModel string
+
+	// AnswerSpan / Answer hold the answer-endpoint config blocks.
+	AnswerSpan enginecfg.AnswerSpanBlock
+	Answer     enginecfg.AnswerBlock
+
+	// Replay is the replay-trace store. Every /v1/answer and
+	// /v1/answer/treewalk response is stamped with a trace_token and
+	// persisted here. Nil skips replay capture for those endpoints.
+	Replay retrieval.ReplayStore
+
+	// TreeWalkStrategy is the dedicated page-based agentic strategy
+	// instance used by /v1/answer/treewalk, independent of whichever
+	// selection strategy retrieval.strategy chose. Nil (or
+	// TreeWalk.Enabled=false) makes the endpoint return 501.
+	TreeWalkStrategy *retrieval.TreeWalkStrategy
+
+	// TreeWalk carries the page-based answer endpoint's config. The
+	// per-request max_hops / max_pages_per_fetch fields override it.
+	TreeWalk enginecfg.TreeWalkBlock
+
+	// Judge is the System One model. /v1/answer uses it to choose each
+	// pincite's sentence. Nil falls back to lexical choice.
+	Judge llmgate.Judge
+
+	// Pincites builds and serves page layouts and page images, and
+	// places citations on the page (HAL-832). Nil leaves citations
+	// without regions and the page routes answering 501.
+	Pincites *pincite.Service
+
+	// BYOK builds a client on a caller's own model key for the answer
+	// step (X-LLM-* headers). Nil refuses such requests with 501.
+	BYOK LLMFactory
+
+	// LLMModelFunc names the default answer model per request, so a
+	// model chosen in the dashboard applies without a restart. Wins over
+	// LLMModel whenever it returns a name.
+	LLMModelFunc func() string
+
+	// Models is the instance's model registry (HAL-2663). When set, the
+	// admin API at /admin/v1/models manages it, and routes that need a
+	// model answer 503 models_not_configured while none is configured.
+	Models *models.Registry
+}
+
+// Router builds the chi router with all v1 routes and the full
+// middleware stack described in SERVER.md:
+//
+//  1. RequestID — generate or propagate X-Request-ID
+//  2. RealIP — honour X-Forwarded-For behind a trusted proxy
+//  3. Recovery — convert panics into 500s with a logged stack trace
+//  4. AccessLog — structured access log (method, path, status, duration)
+//  5. Metrics — Prometheus histograms + counters
+//  6. Tracing — OpenTelemetry root span per request (optional)
+//  7. Auth — skipped for /v1/health, /v1/version, /metrics
+//  8. RateLimit — optional, token bucket per principal
+//  9. The handler itself
+func Router(d Deps) http.Handler {
+	r := chi.NewRouter()
+
+	// ── Middleware stack (order matters) ───────────────────────────
+
+	// CORS must be first so preflight OPTIONS responses are sent
+	// before any auth or rate-limit middleware can reject them.
+	if d.Config.CORS.Enabled {
+		r.Use(middleware.CORS(middleware.CORSConfig{
+			AllowedOrigins: d.Config.CORS.AllowedOrigins,
+			MaxAge:         d.Config.CORS.MaxAge,
+		}))
+	}
+
+	r.Use(middleware.RequestID)
+	// Every request records where its time went (engine work vs waiting
+	// on the Judge, the answer model, the database, storage); the query
+	// and answer handlers return it as "timing".
+	r.Use(reqtiming.Middleware)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recovery(d.Logger))
+	r.Use(middleware.AccessLog(d.Logger))
+
+	if d.Config.Metrics.Enabled {
+		r.Use(middleware.Metrics)
+	}
+
+	// OpenTelemetry tracing (adds root span per request).
+	if d.Config.Tracing.Enabled {
+		r.Use(middleware.Tracing)
+	}
+
+	// Auth: build the authenticator from config.
+	var auth middleware.Authenticator
+	switch d.Config.Auth.Mode {
+	case "api_key":
+		auth = middleware.NewStaticAPIKey(d.Config.Auth.APIKey)
+	default:
+		auth = middleware.NoAuth{}
+	}
+	r.Use(middleware.Auth(auth))
+
+	// Single-tenant self-host: requests without an org header belong to
+	// the configured default org (auth.default_org).
+	if d.Config.Auth.DefaultOrg != "" {
+		r.Use(middleware.DefaultOrg(d.Config.Auth.DefaultOrg))
+	}
+
+	// Rate limit (optional).
+	if d.Config.RateLimit.Enabled {
+		r.Use(middleware.RateLimit(d.Config.RateLimit.RequestsPerMinute))
+	}
+
+	// Per-principal rate limit (optional, Phase 3).
+	if d.Config.RateLimit.PerPrincipalRPM > 0 {
+		r.Use(middleware.PrincipalRateLimit(d.Config.RateLimit.PerPrincipalRPM))
+	}
+
+	// Governance: max body size and per-endpoint timeout.
+	r.Use(middleware.MaxBodySize(d.Config.Governance.MaxBodySizeBytes))
+	r.Use(middleware.EndpointTimeout(
+		d.Config.Governance.DefaultTimeout,
+		d.Config.Governance.QueryTimeout,
+	))
+
+	// Idempotency: cache POST /v1/documents responses by
+	// Idempotency-Key header to prevent duplicate ingestion.
+	r.Use(middleware.Idempotency(middleware.IdempotencyConfig{}))
+
+	// ── REST Handlers (hand-written, chi) ─────────────────────────
+	health := NewHealthHandler(d.Version)
+	docs := NewDocumentsHandler(d.Logger, d.DB, d.Storage, d.Queue)
+	query := NewQueryHandler(d.Logger, d.DB, d.Storage, d.Strategy, d.Strategies)
+	queryStream := NewQueryStreamHandler(d.Logger, d.DB, d.Storage, d.Strategy)
+	queryMulti := NewQueryMultiHandler(d.Logger, d.Storage, d.Strategy, d.MultiDoc)
+	queryStreamMulti := NewQueryStreamMultiHandler(d.Logger, d.Storage, d.MultiDoc)
+	answer := NewAnswerHandler(d.Logger, d.DB, d.Storage, d.Strategy, d.LLM, d.LLMModel, d.AnswerSpan, d.Answer, d.Replay).WithPincites(d.Judge, d.Pincites).WithBYOK(d.BYOK).WithModelFunc(d.LLMModelFunc)
+	answerTreeWalk := NewAnswerTreeWalkHandler(d.Logger, d.DB, d.Storage, d.LLM, d.LLMModel, d.AnswerSpan, d.Replay, d.TreeWalkStrategy, d.TreeWalk).WithModelFunc(d.LLMModelFunc)
+	answerTreeWalk.pincites = d.Pincites
+	answerStore := NewAnswerStoreHandler(d.Logger, d.DB, d.Storage, d.LLM, d.LLMModel).WithModelFunc(d.LLMModelFunc)
+	answerStore.pincites = d.Pincites
+	var catalog corpusCatalog
+	if d.DB != nil {
+		catalog = d.DB
+	}
+	corpus := NewCorpusHandler(d.Logger, catalog, d.CorpusLibrary, d.CorpusNavigator, answerStore)
+	pages := NewPincitesHandler(d.Logger, d.DB, d.Pincites)
+	webhook := NewWebhookHandler(d.Logger, d.Queue)
+
+	// ── Connect-RPC Handlers (generated stubs, three-transport) ───
+	// These serve the same API over Connect (HTTP/JSON), gRPC, and
+	// gRPC-Web — all from the same handler.
+	connectHealth := connecthandler.NewHealthService(d.Version)
+	connectDocs := connecthandler.NewDocumentsService(d.Logger, d.DB, d.Storage, d.Queue)
+	connectQuery := connecthandler.NewQueryService(d.Logger, d.DB, d.Storage, d.Strategy, d.MultiDoc)
+
+	// Mount Connect-RPC service handlers. Each returns (path, handler).
+	healthPath, healthHandler := vectorlessv1connect.NewHealthServiceHandler(connectHealth)
+	docsPath, docsHandler := vectorlessv1connect.NewDocumentsServiceHandler(connectDocs)
+	queryPath, queryHandler := vectorlessv1connect.NewQueryServiceHandler(connectQuery)
+
+	// needsModel answers 503 models_not_configured on routes that cannot
+	// work without a generative model while none is configured.
+	needsModel := RequireModels(d.Models)
+	needsModelForIngest := RequireModelsForIngest(d.Models, d.Config.Engine.Ingest.Mode)
+
+	r.Mount(healthPath, healthHandler)
+	r.Mount(docsPath, needsModelForIngest(docsHandler))
+	r.Mount(queryPath, needsModel(queryHandler))
+
+	// ── REST Routes (kept for backward compat + curl-friendliness) ─
+
+	// Prometheus metrics endpoint (outside /v1 versioning).
+	if d.Config.Metrics.Enabled {
+		r.Handle("/metrics", promhttp.Handler())
+	}
+
+	r.Route("/v1", func(r chi.Router) {
+		// Health / meta
+		r.Get("/health", health.HandleHealth)
+		r.Get("/version", health.HandleVersion)
+
+		// Documents
+		r.Route("/documents", func(r chi.Router) {
+			r.Get("/", docs.HandleListDocuments)
+			r.With(needsModelForIngest).Post("/", docs.HandleIngestDocument)
+			r.Get("/{id}", docs.HandleGetDocument)
+			r.Delete("/{id}", docs.HandleDeleteDocument)
+			r.Get("/{id}/tree", docs.HandleGetTree)
+			// The structure with page spans, for the structure explorer.
+			r.Get("/{id}/structure", docs.HandleGetStructure)
+			r.Get("/{id}/llms.txt", docs.HandleGetLlmsTxt)
+			r.Get("/{id}/text", docs.HandleGetText)
+			r.Get("/{id}/source", docs.HandleGetDocumentSource)
+			// Page geometry for pincites: the page list with sizes,
+			// and each page as an immutable image.
+			r.Get("/{id}/pages", pages.HandleListPages)
+			r.Get("/{id}/pages/{n}/image", pages.HandlePageImage)
+		})
+
+		// Sections
+		r.Get("/sections/{id}", docs.HandleGetSection)
+
+		// Query
+		r.Route("/query", func(r chi.Router) {
+			r.Use(needsModel)
+			r.Post("/", query.HandleQuery)
+			r.Post("/stream", queryStream.HandleQueryStream)
+			r.Post("/multi", queryMulti.HandleQueryMulti)
+			r.Post("/multi/stream", queryStreamMulti.HandleQueryStreamMulti)
+			// One question over a whole collection (HAL-3075).
+			r.Post("/corpus", corpus.HandleQueryCorpus)
+		})
+
+		// Answer: retrieval + synthesis in one round-trip. /answer
+		// uses the configured selection strategy; /answer/treewalk
+		// runs the page-based agentic loop end-to-end.
+		r.With(needsModel).Post("/answer", answer.HandleAnswer)
+		r.With(needsModel).Post("/answer/treewalk", answerTreeWalk.HandleAnswerTreeWalk)
+		// Store answer: map-reduce a question across many documents into
+		// ONE synthesised answer with per-document citations.
+		r.With(needsModel).Post("/answer/store", answerStore.HandleAnswerStore)
+		// Corpus answer: route, read and merge evidence across the
+		// collection on the Judge, with bridge hops, then one answer.
+		r.With(needsModel).Post("/answer/corpus", corpus.HandleAnswerCorpus)
+
+		// Which model providers are in effect, for any authenticated
+		// caller: the dashboard's setup banner reads it. No keys.
+		r.Get("/models/status", ModelsStatusHandler(d.Models))
+	})
+
+	// Admin: the instance's model providers (HAL-2663). Only a caller
+	// holding the engine token — the control plane — may use it.
+	if d.Models != nil {
+		admin := NewAdminModelsHandler(d.Logger, d.Models)
+		r.Route("/admin/v1/models", func(r chi.Router) {
+			r.Use(RequireEngineToken)
+			r.Get("/", admin.HandleGet)
+			r.Put("/", admin.HandlePut)
+			r.Post("/test", admin.HandleTest)
+		})
+	}
+
+	// Internal: queue webhook (QStash).
+	r.Post("/internal/jobs/{kind}", webhook.HandleQueueWebhook)
+
+	return r
+}
