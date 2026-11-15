@@ -1,0 +1,482 @@
+// Package config loads vectorless-server configuration from a YAML file
+// and/or environment variables (prefix VLS_).
+//
+// The server config extends the engine config with server-specific
+// concerns: authentication, observability, and rate limiting. Engine
+// settings (database, storage, queue, LLM, retrieval) are delegated to
+// the engine's own config package.
+//
+// Precedence (highest wins):
+//
+//  1. Environment variables
+//  2. YAML file supplied via --config flag
+//  3. Built-in defaults
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	enginecfg "github.com/hallelx2/vectorless-engine/pkg/config"
+)
+
+// Config is the root server configuration. It embeds the engine config
+// so the server binary can boot the full stack from one config file.
+type Config struct {
+	// Engine embeds the full engine configuration (database, storage,
+	// queue, LLM, retrieval, logging).
+	Engine enginecfg.Config `yaml:"engine"`
+
+	// Server configures the HTTP/gRPC listener.
+	Server ServerConfig `yaml:"server"`
+
+	// Auth configures request authentication.
+	Auth AuthConfig `yaml:"auth"`
+
+	// Metrics configures Prometheus metrics.
+	Metrics MetricsConfig `yaml:"metrics"`
+
+	// Tracing configures OpenTelemetry distributed tracing.
+	Tracing TracingConfig `yaml:"tracing"`
+
+	// RateLimit configures optional global rate limiting.
+	RateLimit RateLimitConfig `yaml:"rate_limit"`
+
+	// CORS configures Cross-Origin Resource Sharing headers.
+	CORS CORSConfig `yaml:"cors"`
+
+	// Governance configures request size limits and timeouts.
+	Governance GovernanceConfig `yaml:"governance"`
+
+	// Models configures model providers entered in the dashboard.
+	Models ModelsConfig `yaml:"models"`
+}
+
+// ModelsConfig configures instance-level model providers (HAL-2663).
+type ModelsConfig struct {
+	// EncryptionKey seals provider keys stored in the database
+	// (AES-256-GCM). 32 bytes as base64 or hex, or a passphrase of at
+	// least 32 characters. Empty: keys can come only from the
+	// environment, and the admin API refuses to store any.
+	EncryptionKey string `yaml:"encryption_key"`
+
+	// ReloadSeconds is how often each replica checks the stored settings
+	// for a change made elsewhere. A change made through this replica's
+	// admin API applies immediately. Default 10; 0 disables polling.
+	ReloadSeconds int `yaml:"reload_seconds"`
+
+	// AnswerModel is the environment's answer model, used when the
+	// dashboard has not set one. Empty uses the driver's model.
+	AnswerModel string `yaml:"answer_model"`
+}
+
+// ServerConfig configures the HTTP server.
+type ServerConfig struct {
+	// Addr is the listen address (e.g. ":8080", "0.0.0.0:443").
+	Addr string `yaml:"addr"`
+
+	// ReadTimeout bounds how long the server waits for request headers +
+	// body. Default 30s.
+	ReadTimeout time.Duration `yaml:"read_timeout"`
+
+	// WriteTimeout bounds how long the server waits for the full
+	// response to be written. Default 120s.
+	WriteTimeout time.Duration `yaml:"write_timeout"`
+
+	// DrainTimeout is the grace period for in-flight requests during
+	// shutdown. Default 15s (matches Kubernetes terminationGracePeriodSeconds).
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
+
+	// TLS enables direct TLS termination. When both CertFile and
+	// KeyFile are set, the server listens with TLS. Otherwise it
+	// serves plaintext and expects a reverse proxy to terminate TLS.
+	TLS TLSConfig `yaml:"tls"`
+}
+
+// TLSConfig enables direct TLS termination.
+type TLSConfig struct {
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	MinVersion string `yaml:"min_version"`
+}
+
+// Enabled reports whether direct TLS is configured.
+func (t TLSConfig) Enabled() bool {
+	return t.CertFile != "" && t.KeyFile != ""
+}
+
+// AuthConfig configures request authentication.
+type AuthConfig struct {
+	// Mode selects the authentication strategy.
+	//   "none"    — all requests are anonymous (default).
+	//   "api_key" — require a static Bearer token.
+	Mode string `yaml:"mode"`
+
+	// APIKey is the expected Bearer token when Mode is "api_key".
+	// Compared with crypto/subtle.ConstantTimeCompare.
+	APIKey string `yaml:"api_key"`
+
+	// DefaultOrg is the org a request belongs to when it carries no
+	// X-Vectorless-Org header. Behind the control plane every request
+	// names its org and this stays empty, so a missing header is a 400.
+	// A single-tenant self-host with no control plane sets it (the
+	// standalone engine uses the nil UUID) so callers need only the
+	// bearer token. A header on the request still wins.
+	DefaultOrg string `yaml:"default_org"`
+}
+
+// MetricsConfig configures Prometheus metrics.
+type MetricsConfig struct {
+	// Enabled toggles the /metrics endpoint. Default true.
+	Enabled bool `yaml:"enabled"`
+}
+
+// TracingConfig configures OpenTelemetry tracing.
+type TracingConfig struct {
+	// Enabled toggles OTLP trace export. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// Endpoint is the OTLP gRPC collector endpoint
+	// (e.g. "localhost:4317", "otel-collector:4317").
+	Endpoint string `yaml:"endpoint"`
+
+	// Insecure disables TLS for the OTLP exporter. Use for local dev.
+	Insecure bool `yaml:"insecure"`
+
+	// ServiceName overrides the service name in traces. Default
+	// "vectorless-server".
+	ServiceName string `yaml:"service_name"`
+
+	// SampleRate is the fraction of traces to sample [0.0, 1.0].
+	// Default 1.0 (sample everything).
+	SampleRate float64 `yaml:"sample_rate"`
+}
+
+// RateLimitConfig configures optional global rate limiting.
+type RateLimitConfig struct {
+	// Enabled toggles rate limiting. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// RequestsPerMinute is the maximum number of requests per minute
+	// across all clients (global bucket). Default 600.
+	RequestsPerMinute int `yaml:"requests_per_minute"`
+
+	// PerPrincipalRPM is the per-principal rate limit. Each
+	// authenticated principal gets their own bucket. 0 = disabled.
+	PerPrincipalRPM int `yaml:"per_principal_rpm"`
+}
+
+// CORSConfig configures Cross-Origin Resource Sharing headers.
+type CORSConfig struct {
+	// Enabled toggles CORS header injection. Default true.
+	Enabled bool `yaml:"enabled"`
+
+	// AllowedOrigins is the list of origins allowed to make cross-origin
+	// requests. Use ["*"] to allow any origin (suitable for development).
+	AllowedOrigins []string `yaml:"allowed_origins"`
+
+	// MaxAge is the Access-Control-Max-Age value in seconds. Browsers
+	// cache preflight responses for this duration. Default 86400 (24h).
+	MaxAge int `yaml:"max_age"`
+}
+
+// GovernanceConfig configures request body size limits and per-request
+// timeouts.
+type GovernanceConfig struct {
+	// MaxBodySizeBytes is the maximum allowed request body size.
+	// Default 33554432 (32 MiB), suitable for multipart uploads.
+	MaxBodySizeBytes int64 `yaml:"max_body_size_bytes"`
+
+	// DefaultTimeout is the per-request context deadline for most
+	// endpoints. Default 30s.
+	DefaultTimeout time.Duration `yaml:"default_timeout"`
+
+	// QueryTimeout is the per-request context deadline for query
+	// endpoints, which typically involve embedding + retrieval.
+	// Default 120s.
+	QueryTimeout time.Duration `yaml:"query_timeout"`
+}
+
+// Default returns a Config with sensible defaults.
+func Default() Config {
+	return Config{
+		Engine: enginecfg.Default(),
+		Server: ServerConfig{
+			Addr:         ":8080",
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 120 * time.Second,
+			DrainTimeout: 15 * time.Second,
+		},
+		Auth: AuthConfig{
+			Mode: "none",
+		},
+		Models: ModelsConfig{ReloadSeconds: 10},
+		Metrics: MetricsConfig{
+			Enabled: true,
+		},
+		Tracing: TracingConfig{
+			Enabled:     false,
+			ServiceName: "vectorless-server",
+			SampleRate:  1.0,
+		},
+		RateLimit: RateLimitConfig{
+			Enabled:           false,
+			RequestsPerMinute: 600,
+		},
+		CORS: CORSConfig{
+			Enabled:        true,
+			AllowedOrigins: []string{"*"},
+			MaxAge:         86400,
+		},
+		Governance: GovernanceConfig{
+			MaxBodySizeBytes: 33554432, // 32 MiB
+			DefaultTimeout:   30 * time.Second,
+			QueryTimeout:     120 * time.Second,
+		},
+	}
+}
+
+// Load reads configuration from a YAML file (optional) and applies
+// environment overrides. Pass an empty path to skip the file.
+func Load(path string) (Config, error) {
+	cfg := Default()
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return cfg, fmt.Errorf("read config: %w", err)
+		}
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return cfg, fmt.Errorf("parse config: %w", err)
+		}
+	}
+	applyEnvOverrides(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func applyEnvOverrides(c *Config) {
+	// ── Server ────────────────────────────────────────────────────
+	if v := os.Getenv("VLS_ADDR"); v != "" {
+		c.Server.Addr = v
+	}
+
+	// ── Auth ──────────────────────────────────────────────────────
+	if v := os.Getenv("VLS_AUTH_MODE"); v != "" {
+		c.Auth.Mode = v
+	}
+	if v := os.Getenv("VLS_AUTH_API_KEY"); v != "" {
+		c.Auth.APIKey = v
+	}
+	if v := os.Getenv("VLS_AUTH_DEFAULT_ORG"); v != "" {
+		c.Auth.DefaultOrg = v
+	}
+
+	// ── Metrics ───────────────────────────────────────────────────
+	if v := os.Getenv("VLS_METRICS_ENABLED"); v != "" {
+		c.Metrics.Enabled = v == "true" || v == "1"
+	}
+
+	// ── Tracing ───────────────────────────────────────────────────
+	if v := os.Getenv("VLS_TRACING_ENABLED"); v != "" {
+		c.Tracing.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VLS_TRACING_ENDPOINT"); v != "" {
+		c.Tracing.Endpoint = v
+	}
+	if v := os.Getenv("VLS_TRACING_INSECURE"); v != "" {
+		c.Tracing.Insecure = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VLS_TRACING_SERVICE_NAME"); v != "" {
+		c.Tracing.ServiceName = v
+	}
+
+	// ── Rate limit ────────────────────────────────────────────────
+	if v := os.Getenv("VLS_RATE_LIMIT_ENABLED"); v != "" {
+		c.RateLimit.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VLS_RATE_LIMIT_RPM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RateLimit.RequestsPerMinute = n
+		}
+	}
+
+	// ── CORS ──────────────────────────────────────────────────────
+	if v := os.Getenv("VLS_CORS_ENABLED"); v != "" {
+		c.CORS.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VLS_CORS_ORIGINS"); v != "" {
+		c.CORS.AllowedOrigins = strings.Split(v, ",")
+	}
+
+	// ── TLS ───────────────────────────────────────────────────────
+	if v := os.Getenv("VLS_TLS_CERT_FILE"); v != "" {
+		c.Server.TLS.CertFile = v
+	}
+	if v := os.Getenv("VLS_TLS_KEY_FILE"); v != "" {
+		c.Server.TLS.KeyFile = v
+	}
+
+	// ── Engine pass-through ───────────────────────────────────────
+	// The engine's own config.Load handles VLE_* env vars, but when
+	// running inside the server binary the operator may prefer VLS_*
+	// or the engine vars. We forward the most critical ones so a
+	// single env-var namespace works.
+	if v := firstEnv("VLS_DATABASE_URL", "VLE_DATABASE_URL"); v != "" {
+		c.Engine.Database.URL = v
+	}
+	if v := firstEnv("VLS_LOG_LEVEL", "VLE_LOG_LEVEL"); v != "" {
+		c.Engine.Log.Level = v
+	}
+	if v := firstEnv("VLS_ANTHROPIC_API_KEY", "VLE_ANTHROPIC_API_KEY", "VLS_LLM_ANTHROPIC_API_KEY", "VLE_LLM_ANTHROPIC_API_KEY"); v != "" {
+		c.Engine.LLM.Anthropic.APIKey = v
+	}
+	if v := firstEnv("VLS_OPENAI_API_KEY", "VLE_OPENAI_API_KEY", "VLS_LLM_OPENAI_API_KEY", "VLE_LLM_OPENAI_API_KEY"); v != "" {
+		c.Engine.LLM.OpenAI.APIKey = v
+	}
+	if v := firstEnv("VLS_GEMINI_API_KEY", "VLE_GEMINI_API_KEY", "VLS_LLM_GEMINI_API_KEY", "VLE_LLM_GEMINI_API_KEY"); v != "" {
+		c.Engine.LLM.Gemini.APIKey = v
+	}
+	enginecfg.ApplyVertexEnv(&c.Engine.LLM.Vertex, "VLS_", "VLE_")
+	if v := firstEnv("VLS_STORAGE_DRIVER", "VLE_STORAGE_DRIVER"); v != "" {
+		c.Engine.Storage.Driver = v
+	}
+	if v := firstEnv("VLS_QUEUE_DRIVER", "VLE_QUEUE_DRIVER"); v != "" {
+		c.Engine.Queue.Driver = v
+	}
+	if v := firstEnv("VLS_LLM_DRIVER", "VLE_LLM_DRIVER"); v != "" {
+		c.Engine.LLM.Driver = v
+	}
+	// Ingest mode (full | minimal). Forwarded so the live
+	// vectorless-server can be flipped to minimal ingest with a single
+	// env var, no secret/config edit. VLS_-prefixed wins over VLE_.
+	if v := firstEnv("VLS_INGEST_MODE", "VLE_INGEST_MODE"); v != "" {
+		c.Engine.Ingest.Mode = v
+	}
+	// TreeWalk final-citation cap. Forwarded so the spray backstop can
+	// be tuned on the live server without a config edit (e.g. tighten
+	// to 1 to force single-citation answers, or relax for a doc set
+	// with many genuinely multi-location questions). VLS_ wins over
+	// VLE_; a garbled or negative value leaves the engine default (3).
+	if v := firstEnv("VLS_RETRIEVAL_TREEWALK_MAX_CITATIONS", "VLE_RETRIEVAL_TREEWALK_MAX_CITATIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.Engine.Retrieval.TreeWalk.MaxCitations = n
+		}
+	}
+	// Total-parse timeout (seconds). Forwarded so the deployed server
+	// honours a tuned parse deadline without a secret/config edit — the
+	// outermost robustness valve against a parse that hangs (pre-LLM,
+	// pure-Go row extraction). VLS_-prefixed wins over VLE_.
+	if v := firstEnv("VLS_INGEST_PARSE_TIMEOUT_SECONDS", "VLE_INGEST_PARSE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.Engine.Ingest.ParseTimeoutSeconds = n
+		}
+	}
+	// Anthropic-compatible gateway overrides (e.g. GLM/Zhipu via
+	// https://api.z.ai/api/anthropic/v1 — the /v1 is required, the client
+	// posts to ${base}/messages): base URL + model, so the anthropic
+	// driver can run a non-Anthropic model without a secret edit.
+	if v := firstEnv("VLS_LLM_ANTHROPIC_BASE_URL", "VLE_LLM_ANTHROPIC_BASE_URL"); v != "" {
+		c.Engine.LLM.Anthropic.BaseURL = v
+	}
+	if v := firstEnv("VLS_LLM_ANTHROPIC_MODEL", "VLE_LLM_ANTHROPIC_MODEL"); v != "" {
+		c.Engine.LLM.Anthropic.Model = v
+	}
+	// The Judge (TypeSafe). The engine's own loader reads these; the
+	// server's did not, so a deployed server could only take the key from
+	// YAML — a secret in a config file. Same precedence as the engine:
+	// VLS_ wins, then VLE_, then the provider's own TYPESAFE_API_KEY.
+	if v := firstEnv("VLS_TYPESAFE_API_KEY", "VLE_TYPESAFE_API_KEY", "TYPESAFE_API_KEY"); v != "" {
+		c.Engine.LLM.Judge.TypeSafe.APIKey = v
+	}
+	if v := firstEnv("VLS_TYPESAFE_BASE_URL", "VLE_TYPESAFE_BASE_URL", "TYPESAFE_BASE_URL"); v != "" {
+		c.Engine.LLM.Judge.TypeSafe.BaseURL = v
+	}
+	if v := firstEnv("VLS_TYPESAFE_MODEL", "VLE_TYPESAFE_MODEL", "TYPESAFE_MODEL"); v != "" {
+		c.Engine.LLM.Judge.TypeSafe.Model = v
+	}
+	// OpenAI-compatible servers and per-driver models, so every
+	// provider the dashboard offers can also be configured from the
+	// environment alone.
+	if v := firstEnv("VLS_LLM_OPENAI_BASE_URL", "VLE_LLM_OPENAI_BASE_URL"); v != "" {
+		c.Engine.LLM.OpenAI.BaseURL = v
+	}
+	if v := firstEnv("VLS_LLM_OPENAI_MODEL", "VLE_LLM_OPENAI_MODEL"); v != "" {
+		c.Engine.LLM.OpenAI.Model = v
+	}
+	if v := firstEnv("VLS_LLM_GEMINI_MODEL", "VLE_LLM_GEMINI_MODEL"); v != "" {
+		c.Engine.LLM.Gemini.Model = v
+	}
+	if v := firstEnv("VLS_LLM_ANSWER_MODEL", "VLE_LLM_ANSWER_MODEL"); v != "" {
+		c.Models.AnswerModel = v
+	}
+	// Instance encryption key for provider keys entered in the dashboard.
+	if v := firstEnv("VLS_ENCRYPTION_KEY", "VLE_ENCRYPTION_KEY"); v != "" {
+		c.Models.EncryptionKey = v
+	}
+	if v := firstEnv("VLS_MODELS_RELOAD_SECONDS", "VLE_MODELS_RELOAD_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.Models.ReloadSeconds = n
+		}
+	}
+	// Retrieval strategy, so a deployment can switch to judgewalk
+	// without a config edit.
+	if v := firstEnv("VLS_RETRIEVAL_STRATEGY", "VLE_RETRIEVAL_STRATEGY"); v != "" {
+		c.Engine.Retrieval.Strategy = v
+	}
+}
+
+// firstEnv returns the first non-empty value from the named env vars.
+func firstEnv(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// Validate checks required fields for the selected modes.
+func (c Config) Validate() error {
+	// Auth validation.
+	switch c.Auth.Mode {
+	case "none":
+		// nothing required
+	case "api_key":
+		if c.Auth.APIKey == "" {
+			return errors.New("auth.api_key is required when auth.mode=api_key")
+		}
+	default:
+		return fmt.Errorf("unknown auth.mode: %q (want \"none\" or \"api_key\")", c.Auth.Mode)
+	}
+
+	// TLS validation.
+	if c.Server.TLS.CertFile != "" && c.Server.TLS.KeyFile == "" {
+		return errors.New("server.tls.key_file is required when cert_file is set")
+	}
+	if c.Server.TLS.KeyFile != "" && c.Server.TLS.CertFile == "" {
+		return errors.New("server.tls.cert_file is required when key_file is set")
+	}
+	if v := c.Server.TLS.MinVersion; v != "" && v != "1.2" && v != "1.3" {
+		return fmt.Errorf("server.tls.min_version must be 1.2 or 1.3, got %q", v)
+	}
+
+	// Tracing validation.
+	if c.Tracing.Enabled && c.Tracing.Endpoint == "" {
+		return errors.New("tracing.endpoint is required when tracing.enabled=true")
+	}
+
+	// Delegate engine-level validation.
+	if err := c.Engine.Validate(); err != nil {
+		return fmt.Errorf("engine config: %w", err)
+	}
+
+	return nil
+}
