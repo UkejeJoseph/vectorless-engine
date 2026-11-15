@@ -1,0 +1,1006 @@
+// Command server is the vectorless transport server.
+//
+// It wraps the vectorless engine as a thin HTTP + gRPC service, adding
+// authentication, observability, and rate limiting. The engine runs
+// in-process — there is no network hop between server and engine.
+//
+// Usage:
+//
+//	vectorless-server --config config.yaml          # HTTP + embedded workers
+//	vectorless-server --config config.yaml --role worker  # queue workers only
+//
+// See docs/SERVER.md in the engine repo for the full design document.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
+	"time"
+
+	"github.com/hallelx2/vectorless-engine/pkg/reqtiming"
+
+	"github.com/hallelx2/llmgate"
+	"github.com/hallelx2/llmgate/judge/typesafe"
+	"github.com/hallelx2/llmgate/middleware/limit"
+	"github.com/hallelx2/llmgate/middleware/retry"
+	"github.com/hallelx2/llmgate/pricing"
+	"github.com/hallelx2/llmgate/provider/anthropic"
+	"github.com/hallelx2/llmgate/provider/gemini"
+	"github.com/hallelx2/llmgate/provider/openai"
+
+	"github.com/hallelx2/vectorless-engine/pkg/db"
+	"github.com/hallelx2/vectorless-engine/pkg/ingest"
+	"github.com/hallelx2/vectorless-engine/pkg/models"
+	"github.com/hallelx2/vectorless-engine/pkg/parser"
+	"github.com/hallelx2/vectorless-engine/pkg/pincite"
+	"github.com/hallelx2/vectorless-engine/pkg/queue"
+	"github.com/hallelx2/vectorless-engine/pkg/retrieval"
+	"github.com/hallelx2/vectorless-engine/pkg/storage"
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+
+	"github.com/hallelx2/vectorless-engine/internal/config"
+	"github.com/hallelx2/vectorless-engine/internal/handler"
+	"github.com/hallelx2/vectorless-engine/internal/telemetry"
+
+	enginecfg "github.com/hallelx2/vectorless-engine/pkg/config"
+)
+
+// version is set at build time via -ldflags "-X main.version=..."
+var version = "dev"
+
+// buildVersion is version, or — for a build without -ldflags, such as
+// go run or go build in a checkout — the commit the binary was built from,
+// so /v1/version always names the build a benchmark measured (HAL-1582).
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return version
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return "dev-" + rev + dirty
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	configPath := flag.String("config", "", "path to config.yaml (optional; env vars take precedence)")
+	role := flag.String("role", "server", `role to run: "server" (HTTP + workers) or "worker" (queue workers only)`)
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	logger := newLogger(cfg.Engine.Log)
+	logger.Info("starting vectorless-server",
+		"version", buildVersion(),
+		"role", *role,
+		"addr", cfg.Server.Addr,
+		"auth_mode", cfg.Auth.Mode,
+		"metrics_enabled", cfg.Metrics.Enabled,
+		"tracing_enabled", cfg.Tracing.Enabled,
+		"storage_driver", cfg.Engine.Storage.Driver,
+		"queue_driver", cfg.Engine.Queue.Driver,
+		"llm_driver", cfg.Engine.LLM.Driver,
+		"retrieval_strategy", cfg.Engine.Retrieval.Strategy,
+	)
+
+	// Surface any model with no price-book entry: its cost reads $0, which
+	// would otherwise masquerade as "free" in usage/benchmark accounting.
+	pricing.WarnFunc = func(model string) {
+		logger.Warn("llm model not in price book; cost reported as 0", "model", model)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// ── OpenTelemetry tracing (optional) ──────────────────────────
+	if cfg.Tracing.Enabled {
+		shutdown, err := telemetry.InitTracer(ctx, telemetry.TracingConfig{
+			Endpoint:    cfg.Tracing.Endpoint,
+			Insecure:    cfg.Tracing.Insecure,
+			ServiceName: cfg.Tracing.ServiceName,
+			Version:     buildVersion(),
+			SampleRate:  cfg.Tracing.SampleRate,
+		})
+		if err != nil {
+			return fmt.Errorf("init tracing: %w", err)
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdown(shutdownCtx); err != nil {
+				logger.Warn("trace export shutdown error", "err", err)
+			}
+		}()
+		logger.Info("tracing: OTLP export enabled", "endpoint", cfg.Tracing.Endpoint)
+	}
+
+	// ── Database ──────────────────────────────────────────────────
+	pool, err := db.Open(ctx, cfg.Engine.Database.URL, int32(cfg.Engine.Database.MaxConns))
+	if err != nil {
+		return fmt.Errorf("init db: %w", err)
+	}
+	defer pool.Close()
+	if err := pool.Migrate(ctx); err != nil {
+		return fmt.Errorf("migrate db: %w", err)
+	}
+	logger.Info("db: migrations applied")
+
+	// ── Storage ───────────────────────────────────────────────────
+	store, err := buildStorage(cfg.Engine.Storage)
+	if err != nil {
+		return fmt.Errorf("init storage: %w", err)
+	}
+	store = reqtiming.WrapStorage(store)
+
+	// ── Queue ─────────────────────────────────────────────────────
+	q, err := buildQueue(cfg.Engine.Queue, cfg.Engine.Database.URL)
+	if err != nil {
+		return fmt.Errorf("init queue: %w", err)
+	}
+	defer func() { _ = q.Close() }() // best-effort close
+
+	// ── Models (HAL-2663) ─────────────────────────────────────────
+	// Model providers come from the environment and from the dashboard
+	// (Settings → Model providers), sealed in instance_settings. The
+	// engine holds the registry's proxies: a change applies on the next
+	// call, on every replica, with no restart. With no key at all the
+	// engine still boots; calls that need a model fail with a typed
+	// "model keys not configured" error instead.
+	var cipher *models.Cipher
+	if cfg.Models.EncryptionKey != "" {
+		c, err := models.NewCipher(cfg.Models.EncryptionKey)
+		if err != nil {
+			return fmt.Errorf("models: %w", err)
+		}
+		cipher = c
+	} else {
+		logger.Warn("models: no VLE_ENCRYPTION_KEY — provider keys can come only from the environment; the dashboard cannot store any")
+	}
+	judgeLimiter := newLimiter("judge", cfg.Engine.LLM.Concurrency, logger)
+	registry := models.New(models.Options{
+		Env:    envModelSettings(cfg),
+		Store:  models.DBStore{Pool: pool},
+		Cipher: cipher,
+		BuildJudge: func(js models.JudgeSettings) (llmgate.Judge, error) {
+			return buildJudge(js, judgeLimiter, logger)
+		},
+		Logger: logger,
+	})
+	if err := registry.Reload(ctx); err != nil {
+		logger.Error("models: stored settings unreadable; using the environment's providers", "err", err)
+	}
+	go registry.Watch(ctx, time.Duration(cfg.Models.ReloadSeconds)*time.Second)
+	logModelStatus(logger, registry.Status())
+
+	// ── LLM + retrieval strategy ──────────────────────────────────
+	// reqtiming wraps outermost, outside the limiter and retries: a call
+	// queued at the limiter is the engine's time, and every attempt of a
+	// retried call is one wait on the provider.
+	llmClient := reqtiming.WrapClient(withModelRetry(limit.Client(newLimiter("llm", cfg.Engine.LLM.Concurrency, logger))(registry.Client()), modelRetry))
+	// judge is always the registry's proxy. Code that takes a different
+	// path without a Judge resolves it per job or request through
+	// models.ActiveJudge; judgewalk falls back to treewalk.
+	judge := reqtiming.WrapJudge(registry.Judge())
+	strategy := buildStrategy(cfg.Engine.Retrieval, llmClient, judge, store, pool)
+
+	// Wrap with caching if enabled in engine config.
+	if cfg.Engine.Retrieval.Cache.Enabled {
+		ttl := time.Duration(cfg.Engine.Retrieval.Cache.TTLSeconds) * time.Second
+		if ttl == 0 {
+			ttl = 10 * time.Minute
+		}
+		strategy = retrieval.NewCached(strategy, retrieval.CachedConfig{
+			MaxEntries: cfg.Engine.Retrieval.Cache.MaxEntries,
+			TTL:        ttl,
+		})
+		logger.Info("retrieval: cache enabled",
+			"max_entries", cfg.Engine.Retrieval.Cache.MaxEntries,
+			"ttl_seconds", cfg.Engine.Retrieval.Cache.TTLSeconds,
+		)
+	}
+
+	// Multi-document query dispatcher.
+	multiDoc := retrieval.NewMultiDoc(strategy, pool.LoadTree)
+
+	// Corpus mode (HAL-3075): one question over a whole collection, routed
+	// and read on the Judge. Its library caches each document's leaves,
+	// pages and routing card across questions.
+	corpusLibrary := retrieval.NewCorpusLibrary(buildJudgeWalkStrategy(judge, store, pool), pool.LoadTree)
+	corpusNavigator := retrieval.CorpusNavigator{Judge: judge}
+
+	// Pre-built set of selectable strategies, keyed by config name.
+	// Backs the per-request "strategy" override on /v1/query so the
+	// benchmark can A/B chunked-tree vs treewalk against this same
+	// running engine without a redeploy. Built from the raw client so
+	// each override behaves identically to booting with that strategy
+	// as the default (no shared cache wrapper across overrides).
+	strategies := buildStrategySet(cfg.Engine.Retrieval, llmClient, judge, store, pool)
+
+	// Replay store: every /v1/answer and /v1/answer/treewalk response
+	// is stamped with a deterministic trace_token and its body bytes
+	// persisted here so /v1/replay can return them verbatim. On by
+	// default; operators opt out via retrieval.replay.enabled=false.
+	var replayStore retrieval.ReplayStore
+	if cfg.Engine.Retrieval.Replay.Enabled {
+		replayStore = retrieval.NewLRUReplayStore(retrieval.LRUReplayConfig{
+			MaxEntries: cfg.Engine.Retrieval.Replay.MaxEntries,
+			TTL:        time.Duration(cfg.Engine.Retrieval.Replay.TTLSeconds) * time.Second,
+		})
+		logger.Info("retrieval: replay store enabled",
+			"max_entries", cfg.Engine.Retrieval.Replay.MaxEntries,
+			"ttl_seconds", cfg.Engine.Retrieval.Replay.TTLSeconds,
+		)
+	}
+
+	// /v1/answer/treewalk gets its OWN TreeWalkStrategy instance,
+	// independent of whatever selection strategy retrieval.strategy
+	// chose, so the endpoint is always available (gated by
+	// retrieval.treewalk.enabled) even on a chunked-tree deployment.
+	var treeWalkStrategy *retrieval.TreeWalkStrategy
+	if cfg.Engine.Retrieval.TreeWalk.Enabled && llmClient != nil {
+		treeWalkStrategy = buildTreeWalkStrategy(cfg.Engine.Retrieval, llmClient, store, pool)
+		logger.Info("retrieval: treewalk answer endpoint enabled",
+			"max_hops", treeWalkStrategy.MaxHops,
+			"page_content_limit", treeWalkStrategy.PageContentLimit,
+			"model_override", cfg.Engine.Retrieval.TreeWalk.Model,
+		)
+	}
+
+	// ── Pincites (HAL-832) ────────────────────────────────────────
+	// Page layouts come from the PDF parser's word positions; page
+	// images from poppler's pdftoppm when the runtime image carries it.
+	// Without pdftoppm, citations still carry regions and the viewer
+	// says pages cannot be rendered here.
+	raster := pincite.Poppler{}
+	if raster.Available() {
+		logger.Info("pincites: page images enabled (pdftoppm)")
+	} else {
+		logger.Warn("pincites: pdftoppm not found — page images disabled; install poppler-utils")
+	}
+	pincites := &pincite.Service{
+		Storage: store, Build: parser.PDFLayout, Raster: raster, Logger: logger,
+		Alive: func(ctx context.Context, id string) bool {
+			ok, err := pool.DocumentExists(ctx, tree.DocumentID(id))
+			return ok || err != nil // on a lookup error, keep rendering
+		},
+	}
+
+	// ── Ingest pipeline ───────────────────────────────────────────
+	pipeline := ingest.NewPipeline(ingest.Pipeline{
+		AfterReady: func(ctx context.Context, pl ingest.Payload) error {
+			src := pincite.Source{DocumentID: string(pl.DocumentID), SourceRef: pl.SourceRef, ContentType: pl.ContentType}
+			if !src.IsPDF() {
+				return ingest.ErrNothingToDo
+			}
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			defer cancel()
+			start := time.Now()
+			err := pincites.Warm(ctx, src)
+			// A delete that raced the warm-up already purged what existed
+			// then; remove whatever the last chunk wrote after it.
+			if exists, derr := pool.DocumentExists(ctx, pl.DocumentID); derr == nil && !exists {
+				if n, perr := ingest.PurgeDocument(ctx, store, pl.DocumentID); perr != nil {
+					logger.Error("pincites: purge after delete during warm-up", "document_id", pl.DocumentID, "removed", n, "err", perr)
+				} else {
+					logger.Info("pincites: document deleted during warm-up; purged its files", "document_id", pl.DocumentID, "removed", n)
+				}
+				return pincite.ErrDocumentGone
+			}
+			if err != nil {
+				logger.Warn("pincites: warm failed; pages render on first view", "document_id", pl.DocumentID, "err", err)
+				return err
+			}
+			logger.Info("pincites: layout and page images ready", "document_id", pl.DocumentID, "elapsed", time.Since(start).Round(time.Millisecond))
+			return nil
+		},
+		DB:                     pool,
+		Storage:                store,
+		LLM:                    llmClient,
+		Judge:                  judge,
+		JudgeThreshold:         cfg.Engine.LLM.Judge.Threshold,
+		Parsers:                ingest.RegistryFromIngestParams(tableOptsFromConfig(cfg.Engine.Ingest.Tables), cfg.Engine.Ingest.MaxSections, time.Duration(cfg.Engine.Ingest.ParseTimeoutSeconds)*time.Second),
+		Logger:                 logger,
+		Mode:                   cfg.Engine.Ingest.Mode,
+		HyDEEnabled:            cfg.Engine.Ingest.HyDE.Enabled,
+		HyDEModel:              cfg.Engine.Ingest.HyDE.Model,
+		HyDENumQuestions:       cfg.Engine.Ingest.HyDE.NumQuestions,
+		HyDEConcurrency:        cfg.Engine.Ingest.HyDE.Concurrency,
+		SummaryAxesEnabled:     cfg.Engine.Ingest.SummaryAxes.Enabled,
+		SummaryAxesMaxTopics:   cfg.Engine.Ingest.SummaryAxes.MaxTopics,
+		SummaryAxesMaxEntities: cfg.Engine.Ingest.SummaryAxes.MaxEntities,
+		SummaryAxesMaxNumbers:  cfg.Engine.Ingest.SummaryAxes.MaxNumbers,
+		TOCEnabled:             cfg.Engine.Ingest.TOC.Enabled,
+		TOCModel:               cfg.Engine.Ingest.TOC.Model,
+		TOCConcurrency:         cfg.Engine.Ingest.TOC.Concurrency,
+		TOCCheckPages:          cfg.Engine.Ingest.TOC.TOCCheckPages,
+		GlobalLLMConcurrency:   cfg.Engine.Ingest.GlobalLLMConcurrency,
+	})
+	if cfg.Engine.Ingest.Mode == ingest.ModeMinimal {
+		logger.Info("ingest: MINIMAL mode — parse→persist→ready; skipping summarize/HyDE/multi-axis/TOC + table extraction")
+	} else if cfg.Engine.Ingest.Mode == ingest.ModeTOC {
+		logger.Info("ingest: TOC mode — parse→table of contents→persist→ready; skipping summarize/HyDE/multi-axis + table extraction")
+	} else if cfg.Engine.Ingest.Tables.Enabled {
+		logger.Info("ingest: pdf table extraction enabled",
+			"vertical_strategy", cfg.Engine.Ingest.Tables.VerticalStrategy,
+			"horizontal_strategy", cfg.Engine.Ingest.Tables.HorizontalStrategy,
+			"min_rows", cfg.Engine.Ingest.Tables.MinTableRows,
+			"min_cols", cfg.Engine.Ingest.Tables.MinTableCols,
+		)
+	} else {
+		logger.Info("ingest: pdf table extraction disabled")
+	}
+	q.Register(queue.KindIngestDocument, pipeline.Handler())
+
+	// ── Start subsystems ──────────────────────────────────────────
+	errs := make(chan error, 2)
+
+	// Always start queue workers (both "server" and "worker" roles).
+	go func() {
+		logger.Info("queue: starting workers", "driver", cfg.Engine.Queue.Driver)
+		if err := q.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errs <- fmt.Errorf("queue: %w", err)
+		}
+	}()
+
+	// Only start the HTTP server in "server" role.
+	if *role == "server" {
+		deps := handler.Deps{
+			Logger:           logger,
+			DB:               pool,
+			Storage:          store,
+			Queue:            q,
+			Strategy:         strategy,
+			MultiDoc:         multiDoc,
+			CorpusLibrary:    corpusLibrary,
+			CorpusNavigator:  corpusNavigator,
+			Version:          buildVersion(),
+			Config:           cfg,
+			Strategies:       strategies,
+			LLM:              llmClient,
+			LLMModel:         modelFor(cfg.Engine.LLM),
+			LLMModelFunc:     registry.AnswerModel,
+			Models:           registry,
+			AnswerSpan:       cfg.Engine.Retrieval.AnswerSpan,
+			Answer:           cfg.Engine.Retrieval.Answer,
+			Replay:           replayStore,
+			TreeWalkStrategy: treeWalkStrategy,
+			TreeWalk:         cfg.Engine.Retrieval.TreeWalk,
+			Judge:            judge,
+			Pincites:         pincites,
+			BYOK:             byokFactory,
+		}
+
+		srv := &http.Server{
+			Addr:         cfg.Server.Addr,
+			Handler:      handler.Router(deps),
+			ReadTimeout:  cfg.Server.ReadTimeout,
+			WriteTimeout: cfg.Server.WriteTimeout,
+			TLSConfig:    buildTLSConfig(cfg.Server.TLS),
+		}
+
+		go func() {
+			if cfg.Server.TLS.Enabled() {
+				logger.Info("https: listening (direct TLS)",
+					"addr", cfg.Server.Addr,
+					"cert_file", cfg.Server.TLS.CertFile,
+				)
+				if err := srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					errs <- fmt.Errorf("https: %w", err)
+				}
+				return
+			}
+			logger.Info("http: listening (plaintext — terminate TLS at your proxy)",
+				"addr", cfg.Server.Addr,
+			)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errs <- fmt.Errorf("http: %w", err)
+			}
+		}()
+
+		// Wait for shutdown signal or error.
+		select {
+		case <-ctx.Done():
+			logger.Info("shutdown signal received")
+		case err := <-errs:
+			logger.Error("subsystem failed", "err", err)
+			stop()
+		}
+
+		// Graceful shutdown: drain in-flight requests.
+		drainTimeout := cfg.Server.DrainTimeout
+		if drainTimeout == 0 {
+			drainTimeout = 15 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("http shutdown error", "err", err)
+		}
+	} else {
+		// Worker-only role: just wait for ctx cancellation.
+		select {
+		case <-ctx.Done():
+			logger.Info("shutdown signal received")
+		case err := <-errs:
+			logger.Error("subsystem failed", "err", err)
+			stop()
+		}
+	}
+
+	logger.Info("bye")
+	return nil
+}
+
+// ── Builder helpers (reused from engine, adapted for server config) ──
+
+func buildStorage(c enginecfg.StorageConfig) (storage.Storage, error) {
+	switch c.Driver {
+	case "local":
+		return storage.NewLocal(c.Local.Root)
+	case "s3":
+		return storage.NewS3(storage.S3Config{
+			Endpoint:     c.S3.Endpoint,
+			Region:       c.S3.Region,
+			Bucket:       c.S3.Bucket,
+			AccessKey:    c.S3.AccessKey,
+			SecretKey:    c.S3.SecretKey,
+			UsePathStyle: c.S3.UsePathStyle,
+		})
+	case "gcs":
+		// Auths via Application Default Credentials — on Cloud Run
+		// that's the runtime SA via the metadata server.
+		return storage.NewGCS(context.Background(), storage.GCSConfig{
+			Bucket: c.GCS.Bucket,
+		})
+	default:
+		return nil, fmt.Errorf("unknown storage driver: %s", c.Driver)
+	}
+}
+
+func buildQueue(c enginecfg.QueueConfig, dbURL string) (queue.Queue, error) {
+	switch c.Driver {
+	case "qstash":
+		return queue.NewQStash(queue.QStashConfig{
+			Token:             c.QStash.Token,
+			WebhookBaseURL:    c.QStash.WebhookBaseURL,
+			CurrentSigningKey: c.QStash.CurrentSigningKey,
+			NextSigningKey:    c.QStash.NextSigningKey,
+		})
+	case "river":
+		return queue.NewRiver(queue.RiverConfig{
+			DatabaseURL: dbURL,
+			NumWorkers:  c.River.NumWorkers,
+		})
+	case "asynq":
+		return queue.NewAsynq(queue.AsynqConfig{
+			Addr:        c.Asynq.Addr,
+			Password:    c.Asynq.Password,
+			DB:          c.Asynq.DB,
+			Concurrency: c.Asynq.Concurrency,
+		})
+	default:
+		return nil, fmt.Errorf("unknown queue driver: %s", c.Driver)
+	}
+}
+
+// modelFor returns the configured chat/general-purpose model name for
+// the selected LLM driver. Used as the engine-default fallback when an
+// API request omits an explicit model (answer + answer/treewalk).
+func modelFor(c enginecfg.LLMConfig) string {
+	switch c.Driver {
+	case "anthropic":
+		return c.Anthropic.Model
+	case "openai":
+		return c.OpenAI.Model
+	case "gemini":
+		return c.Gemini.Model
+	case "vertex":
+		if c.Vertex.Model != "" {
+			return c.Vertex.Model
+		}
+		return models.DefaultModels[models.ProviderVertex]
+	}
+	return ""
+}
+
+// newLimiter builds one adaptive limiter for a provider and logs every
+// change it makes: a throttled run must be visible, never silent.
+func newLimiter(name string, c enginecfg.ConcurrencyBlock, logger *slog.Logger) *limit.Limiter {
+	return limit.New(limit.Config{
+		Initial: c.Initial,
+		Max:     c.Max,
+		OnChange: func(e limit.Event) {
+			if e.Cause == "success" {
+				logger.Info("limiter: widened", "provider", name, "from", e.From, "to", e.To)
+				return
+			}
+			logger.Warn("limiter: narrowed", "provider", name, "cause", e.Cause, "from", e.From, "to", e.To, "paused_for", e.PausedFor, "err", e.Err)
+		},
+	})
+}
+
+// buildJudge builds the Judge from settings, wrapped in the shared
+// limiter and retries. Retries share the same schedule as every other
+// provider call; a Judge request that fails past them is handled by the
+// TOC builder, which keeps extraction's pages rather than degrading
+// silently (HAL-1369). The registry calls it again on every change.
+func buildJudge(c models.JudgeSettings, lim *limit.Limiter, logger *slog.Logger) (llmgate.Judge, error) {
+	if c.APIKey == "" {
+		return nil, errors.New("no TypeSafe API key")
+	}
+	j, err := typesafe.New(typesafe.Config{
+		APIKey:    c.APIKey,
+		BaseURL:   c.BaseURL,
+		Model:     c.Model,
+		OnRequest: judgeRequestLogger(logger),
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Open the connection and build the guard's tokenizer now, so the
+	// first query after boot does not pay for either.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := j.Warm(ctx); err != nil {
+			logger.Warn("judge: warm-up failed; the first request will open its own connection", "err", err)
+		}
+	}()
+	// The limiter sits inside retry: each attempt takes a slot, and the
+	// failure that triggers a retry has already narrowed the limit.
+	return retry.NewJudge(retry.Config{MaxRetries: 3})(limit.Judge(lim)(j)), nil
+}
+
+// judgeSlowPrepare is local work before a Judge request goes on the
+// wire that deserves a warning. It is a few milliseconds when healthy;
+// the guard rebuilding its tokenizer made it seconds, and nothing said
+// so until a latency evaluation could not account for a factor of three
+// (HAL-1708).
+const judgeSlowPrepare = 250 * time.Millisecond
+
+// judgeRequestLogger logs where each Judge request's time went: debug
+// always, a warning when local preparation — not the provider — is slow.
+func judgeRequestLogger(logger *slog.Logger) func(typesafe.RequestTrace) {
+	return func(tr typesafe.RequestTrace) {
+		attrs := []any{
+			"questions", tr.Questions, "state_bytes", tr.StateBytes,
+			"prepare_ms", tr.Prepare.Milliseconds(), "guard_counted", tr.GuardCounted,
+			"connect_ms", tr.Connect.Milliseconds(), "conn_reused", tr.ConnReused,
+			"first_byte_ms", tr.FirstByte.Milliseconds(), "total_ms", tr.Total.Milliseconds(),
+			"status", tr.StatusCode, "input_tokens", tr.InputTokens,
+		}
+		if tr.Err != nil {
+			attrs = append(attrs, "err", tr.Err)
+		}
+		if tr.Prepare > judgeSlowPrepare {
+			logger.Warn("judge: slow request preparation — local CPU, not the provider", attrs...)
+			return
+		}
+		logger.Debug("judge: request", attrs...)
+	}
+}
+
+// envModelSettings is what the environment and config file configure:
+// the generative driver when its key is set, and the Judge when its key
+// is set. The dashboard's settings win over these when present.
+func envModelSettings(cfg config.Config) models.Settings {
+	var out models.Settings
+	l := cfg.Engine.LLM
+	var g *models.Generative
+	switch l.Driver {
+	case "anthropic":
+		if l.Anthropic.APIKey != "" {
+			g = &models.Generative{Provider: models.ProviderAnthropic, APIKey: l.Anthropic.APIKey, BaseURL: l.Anthropic.BaseURL, IngestModel: l.Anthropic.Model}
+		}
+	case "openai":
+		if l.OpenAI.APIKey != "" {
+			g = &models.Generative{Provider: models.ProviderOpenAI, APIKey: l.OpenAI.APIKey, BaseURL: l.OpenAI.BaseURL, IngestModel: l.OpenAI.Model}
+		}
+	case "openai-compatible":
+		if l.OpenAI.BaseURL != "" {
+			g = &models.Generative{Provider: models.ProviderOpenAICompatible, APIKey: l.OpenAI.APIKey, BaseURL: l.OpenAI.BaseURL, IngestModel: l.OpenAI.Model}
+		}
+	case "gemini":
+		if l.Gemini.APIKey != "" {
+			g = &models.Generative{Provider: models.ProviderGemini, APIKey: l.Gemini.APIKey, IngestModel: l.Gemini.Model}
+		}
+	case "vertex":
+		// No key to wait for: choosing the driver is the configuration.
+		// Credentials are checked when the client is built.
+		v := l.Vertex
+		g = &models.Generative{Provider: models.ProviderVertex, IngestModel: v.Model, Project: v.Project, Location: v.Location,
+			ThinkingBudget: v.ThinkingBudget, ThinkingLevel: v.ThinkingLevel}
+	}
+	if g != nil {
+		g.AnswerModel = cfg.Models.AnswerModel
+		out.Generative = g
+	}
+	if ts := l.Judge.TypeSafe; ts.APIKey != "" {
+		out.Judge = &models.JudgeSettings{APIKey: ts.APIKey, BaseURL: ts.BaseURL, Model: ts.Model}
+	}
+	return out
+}
+
+// logModelStatus says at boot which providers are in effect and where
+// they came from — never a key.
+func logModelStatus(logger *slog.Logger, st models.Status) {
+	if st.Generative.Configured {
+		logger.Info("models: generative provider ready",
+			"source", st.Generative.Source, "provider", st.Generative.Provider,
+			"ingest_model", st.Generative.IngestModel, "answer_model", st.Generative.AnswerModel)
+	} else {
+		logger.Warn("models: no generative provider configured — the engine is up; ingest and queries answer 503 models_not_configured until an administrator adds one in Settings → Model providers",
+			"error", st.Generative.Error)
+	}
+	if st.Judge.Configured {
+		logger.Info("judge: typesafe enabled — TOC stage and judgewalk retrieval run on the Judge", "source", st.Judge.Source)
+	} else {
+		logger.Warn("judge: none configured — TOC judgements run on the generative driver, one call per page; pincites are chosen lexically", "error", st.Judge.Error)
+	}
+}
+
+func buildLLM(c enginecfg.LLMConfig) (llmgate.Client, error) {
+	switch c.Driver {
+	case "anthropic":
+		return anthropic.New(anthropic.Config{
+			APIKey:         c.Anthropic.APIKey,
+			Model:          c.Anthropic.Model,
+			ReasoningModel: c.Anthropic.ReasoningModel,
+			BaseURL:        c.Anthropic.BaseURL,
+		})
+	case "openai":
+		return openai.New(openai.Config{
+			APIKey:         c.OpenAI.APIKey,
+			Model:          c.OpenAI.Model,
+			ReasoningModel: c.OpenAI.ReasoningModel,
+			BaseURL:        c.OpenAI.BaseURL,
+		})
+	case "gemini":
+		return gemini.New(gemini.Config{
+			APIKey:         c.Gemini.APIKey,
+			Model:          c.Gemini.Model,
+			ReasoningModel: c.Gemini.ReasoningModel,
+		})
+	case "vertex":
+		return models.BuildClient(models.Generative{Provider: models.ProviderVertex, IngestModel: c.Vertex.Model,
+			Project: c.Vertex.Project, Location: c.Vertex.Location,
+			ThinkingBudget: c.Vertex.ThinkingBudget, ThinkingLevel: c.Vertex.ThinkingLevel})
+	default:
+		return nil, fmt.Errorf("unknown llm driver: %s", c.Driver)
+	}
+}
+
+// byokDefaultModel is the answer model used for a caller's own key when
+// the request names none (X-LLM-Model). Callers on another model pass it.
+var byokDefaultModel = map[string]string{
+	"anthropic": "claude-sonnet-5",
+	"openai":    "gpt-4.1-mini",
+	"gemini":    "gemini-2.5-flash",
+}
+
+// byokFactory builds a client on a caller-supplied provider and key for
+// the answer step. Nothing about the key is logged or stored.
+func byokFactory(provider, apiKey, model string) (llmgate.Client, string, error) {
+	def, ok := byokDefaultModel[provider]
+	if !ok {
+		return nil, "", fmt.Errorf("unsupported provider %q (anthropic, openai, gemini)", provider)
+	}
+	if model == "" {
+		model = def
+	}
+	c := enginecfg.LLMConfig{Driver: provider}
+	switch provider {
+	case "anthropic":
+		c.Anthropic = enginecfg.AnthropicBlock{APIKey: apiKey, Model: model}
+	case "openai":
+		c.OpenAI = enginecfg.OpenAIBlock{APIKey: apiKey, Model: model}
+	case "gemini":
+		c.Gemini = enginecfg.GeminiBlock{APIKey: apiKey, Model: model}
+	}
+	client, err := buildLLM(c)
+	if err != nil {
+		return nil, "", err
+	}
+	return withModelRetry(client, modelRetry), model, nil
+}
+
+// modelRetry is how the server's generative calls ride out a provider's
+// refusals: 429s and 5xx, retried with backoff (Retry-After honoured,
+// clamped to MaxDelay). Vertex's shared quota refuses in bursts; with no
+// retry, 28 of 50 /v1/answer calls failed on their first 429 (HAL-3206).
+var modelRetry = retry.Config{MaxRetries: 5, BaseDelay: time.Second, MaxDelay: 20 * time.Second}
+
+// withModelRetry wraps a generative client in modelRetry. It sits outside
+// the limiter, so every attempt takes a slot and a refusal that narrows the
+// limit is seen before the next attempt.
+func withModelRetry(c llmgate.Client, cfg retry.Config) llmgate.Client {
+	if c == nil {
+		return nil
+	}
+	return retry.New(cfg)(c)
+}
+
+// buildStrategy constructs the retrieval strategy named by
+// retrieval.strategy. The DB pool is threaded through so the
+// treewalk strategy can wire a TOC provider that reads
+// documents.toc_tree (the other strategies ignore it).
+func buildStrategy(c enginecfg.RetrievalConfig, client llmgate.Client, judge llmgate.Judge, store storage.Storage, pool *db.Pool) retrieval.Strategy {
+	switch c.Strategy {
+	case "judgewalk":
+		if judge == nil {
+			log.Printf("retrieval: strategy judgewalk needs llm.judge configured; using treewalk")
+			return buildTreeWalkStrategy(c, client, store, pool)
+		}
+		// The Judge's provider refusing service (no credit, a rejected key,
+		// an outage) or no Judge being configured right now falls back to
+		// treewalk instead of failing every query.
+		return retrieval.NewFallbackStrategy(buildJudgeWalkStrategy(judge, store, pool),
+			buildTreeWalkStrategy(c, client, store, pool), nil)
+	case "single-pass":
+		return retrieval.NewSinglePass(client)
+	case "chunked-tree":
+		return retrieval.NewChunkedTree(client)
+	case "agentic":
+		a := retrieval.NewAgentic(client, storageFetcher{s: store})
+		if c.Agentic.MaxHops > 0 {
+			a.MaxHops = c.Agentic.MaxHops
+		}
+		a.ModelOverride = c.Agentic.Model
+		return a
+	case "treewalk":
+		return buildTreeWalkStrategy(c, client, store, pool)
+	case "auto":
+		return retrieval.NewAuto(retrieval.NewSinglePass(client), buildTreeWalkStrategy(c, client, store, pool))
+	default:
+		return retrieval.NewChunkedTree(client)
+	}
+}
+
+// buildStrategySet pre-builds one instance of every selectable
+// strategy, keyed by its config name. The deployed /v1/query handler
+// uses this map to honour a per-request "strategy" override without
+// rebuilding a strategy on the hot path: selection is a map lookup.
+//
+// This is what lets the benchmark A/B chunked-tree vs treewalk
+// against the SAME running engine — no redeploy, no config flip. The
+// caps (agentic max-hops, treewalk page limits, model overrides) come
+// from the same config blocks the default builder reads, so an
+// override behaves identically to booting with that strategy as the
+// default.
+func buildStrategySet(c enginecfg.RetrievalConfig, client llmgate.Client, judge llmgate.Judge, store storage.Storage, pool *db.Pool) map[string]retrieval.Strategy {
+	agentic := retrieval.NewAgentic(client, storageFetcher{s: store})
+	if c.Agentic.MaxHops > 0 {
+		agentic.MaxHops = c.Agentic.MaxHops
+	}
+	agentic.ModelOverride = c.Agentic.Model
+
+	set := map[string]retrieval.Strategy{
+		"single-pass":  retrieval.NewSinglePass(client),
+		"chunked-tree": retrieval.NewChunkedTree(client),
+		"agentic":      agentic,
+		"treewalk":     buildTreeWalkStrategy(c, client, store, pool),
+		"auto":         retrieval.NewAuto(retrieval.NewSinglePass(client), buildTreeWalkStrategy(c, client, store, pool)),
+	}
+	if judge != nil {
+		set["judgewalk"] = retrieval.NewFallbackStrategy(buildJudgeWalkStrategy(judge, store, pool), set["treewalk"], nil)
+	} else {
+		// The same fallback the default builder applies: a request that
+		// names judgewalk on a server with no Judge gets treewalk, not
+		// "unknown strategy".
+		set["judgewalk"] = set["treewalk"]
+	}
+	return set
+}
+
+// buildJudgeWalkStrategy constructs navigation on the Judge: the tree's
+// leaves ranked in one request, the best sections' bodies ranked in one
+// or two more, no generative call (HAL-1371). Selectable per request as
+// strategy=judgewalk whenever llm.judge is configured.
+func buildJudgeWalkStrategy(judge llmgate.Judge, store storage.Storage, pool *db.Pool) *retrieval.JudgeWalkStrategy {
+	s := retrieval.NewJudgeWalkStrategy(judge)
+	s.PageLoader = storagePageLoader{s: store}
+	if pool != nil {
+		s.TOC = dbTOCProvider{db: pool}
+	}
+	s.Pages = storagePageStore{s: store}
+	return s
+}
+
+// buildTreeWalkStrategy constructs the page-based agentic strategy
+// with the storage-backed PageLoader, a DB-backed TOC provider, and
+// the configured caps. Ported from cmd/engine so the DEPLOYED
+// cmd/server binary can serve retrieval.strategy=treewalk AND the
+// /v1/answer/treewalk endpoint.
+//
+// The TOC provider reads documents.toc_tree via the worker-scoped
+// document lookup. The strategy degrades to its synthesised view
+// (built from the loaded section tree) whenever the column is NULL or
+// the read errors, so a document ingested before the TOC builder ran
+// still navigates cleanly.
+func buildTreeWalkStrategy(c enginecfg.RetrievalConfig, client llmgate.Client, store storage.Storage, pool *db.Pool) *retrieval.TreeWalkStrategy {
+	p := retrieval.NewTreeWalkStrategy(client)
+	p.PageLoader = storagePageLoader{s: store}
+	if pool != nil {
+		p.TOC = dbTOCProvider{db: pool}
+	}
+	if c.TreeWalk.MaxHops > 0 {
+		p.MaxHops = c.TreeWalk.MaxHops
+	}
+	if c.TreeWalk.PageContentLimit > 0 {
+		p.PageContentLimit = c.TreeWalk.PageContentLimit
+	}
+	if c.TreeWalk.MaxCitations > 0 {
+		p.MaxCitations = c.TreeWalk.MaxCitations
+	}
+	p.ModelOverride = c.TreeWalk.Model
+	return p
+}
+
+// storagePageLoader adapts a storage.Storage to
+// retrieval.PageContentLoader. Mirrors storageFetcher but lives behind
+// a separate interface so the two callers (agentic / treewalk) can be
+// wired independently. The TreeWalk strategy materialises section
+// bodies once per get_pages observation, so reading the full reader
+// into a []byte is the right shape.
+type storagePageLoader struct{ s storage.Storage }
+
+func (l storagePageLoader) Load(ctx context.Context, ref string) ([]byte, error) {
+	rc, _, err := l.s.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }() // best-effort close
+	return io.ReadAll(rc)
+}
+
+// dbTOCProvider adapts the DB pool to retrieval.TOCProvider. It reads
+// the persisted documents.toc_tree JSONB and returns it verbatim for
+// the get_document_structure tool. A NULL column (the "not yet
+// generated" state) surfaces as retrieval.ErrNoTOC, which the strategy
+// treats as a graceful-degrade signal: it synthesises the TOC view
+// from the section tree instead of failing the request.
+//
+// GetTOC carries only a document ID (the TOCProvider contract), so the
+// lookup uses the worker-scoped accessor. That is safe here: the
+// caller has already resolved + authorised the tree for this document
+// via the org-scoped LoadTree before the strategy ever calls GetTOC,
+// and the TOC tree is the same structural metadata (titles + page
+// ranges, no bodies) already present on that authorised tree.
+type dbTOCProvider struct{ db *db.Pool }
+
+func (p dbTOCProvider) GetTOC(ctx context.Context, docID tree.DocumentID) ([]byte, error) {
+	doc, err := p.db.GetDocumentForWorker(ctx, docID)
+	if err != nil {
+		return nil, err
+	}
+	if len(doc.TOCTree) == 0 {
+		return nil, retrieval.ErrNoTOC
+	}
+	return doc.TOCTree, nil
+}
+
+// storageFetcher adapts a storage.Storage to retrieval.ContentFetcher.
+// The agentic strategy reads section bodies one at a time, so we
+// materialize the full reader contents into a []byte here rather than
+// streaming — section bodies are typically a few KB.
+type storageFetcher struct{ s storage.Storage }
+
+func (sf storageFetcher) Get(ctx context.Context, ref string) ([]byte, error) {
+	rc, _, err := sf.s.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }() // best-effort close
+	return io.ReadAll(rc)
+}
+
+func buildTLSConfig(c config.TLSConfig) *tls.Config {
+	if !c.Enabled() {
+		return nil
+	}
+	min := uint16(tls.VersionTLS12)
+	if c.MinVersion == "1.3" {
+		min = tls.VersionTLS13
+	}
+	return &tls.Config{MinVersion: min}
+}
+
+func newLogger(c enginecfg.LogConfig) *slog.Logger {
+	level := slog.LevelInfo
+	switch c.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	opts := &slog.HandlerOptions{Level: level}
+
+	var h slog.Handler
+	switch c.Format {
+	case "console":
+		h = slog.NewTextHandler(os.Stdout, opts)
+	default:
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
+}
+
+// tableOptsFromConfig translates the engine's TablesConfig (from the
+// embedded engine config block) into the parser-level TableOpts. Returns
+// nil when tables are disabled so the PDF parser short-circuits without
+// instantiating pdftable settings.
+func tableOptsFromConfig(c enginecfg.TablesConfig) *parser.TableOpts {
+	if !c.Enabled {
+		return nil
+	}
+	return &parser.TableOpts{
+		Enabled:            true,
+		VerticalStrategy:   c.VerticalStrategy,
+		HorizontalStrategy: c.HorizontalStrategy,
+		MinTableRows:       c.MinTableRows,
+		MinTableCols:       c.MinTableCols,
+	}
+}
+
+// storagePageStore serves the per-page text ingest persisted at
+// ingest.PagesKey, for judgewalk. Missing pages are not an error: the
+// strategy falls back to the section tree.
+type storagePageStore struct{ s storage.Storage }
+
+func (p storagePageStore) LoadPages(ctx context.Context, docID tree.DocumentID) ([]retrieval.NavPage, error) {
+	rc, _, err := p.s.Get(ctx, ingest.PagesKey(docID))
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	var pages []ingest.PageText
+	if err := json.NewDecoder(rc).Decode(&pages); err != nil {
+		return nil, err
+	}
+	out := make([]retrieval.NavPage, 0, len(pages))
+	for _, pg := range pages {
+		out = append(out, retrieval.NavPage{Number: pg.PageNumber, Text: pg.Text})
+	}
+	return out, nil
+}
