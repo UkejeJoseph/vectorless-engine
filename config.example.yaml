@@ -1,0 +1,502 @@
+# vectorless-engine example configuration.
+#
+# Three ways to configure the engine, in increasing priority:
+#   1. YAML file   - copy this to config.yaml and edit.
+#   2. Environment - VLE_* vars, dot-path flattened with underscores
+#                    (e.g. server.tls.cert_file -> VLE_SERVER_TLS_CERT_FILE).
+#   3. CLI flags   - mirror the YAML tree, dot-separated
+#                    (e.g. --server.addr=:8080, --log.level=debug).
+#
+# Later layers override earlier ones on a per-key basis (not per-subtree),
+# so you can ship a YAML file in the image, set secrets via env, and tweak
+# individual knobs per run with flags.
+#
+# `vectorless-engine config print` prints the effective config with secrets
+# redacted; `vectorless-engine config check` validates it and exits 0/1.
+#
+# ZERO-CONFIG LOCAL MODE
+# ----------------------
+# Run `engine --local` (or set VLE_LOCAL_MODE=true) to boot with no config
+# at all: it listens on :7654, points at a localhost Postgres
+# (postgres://vectorless:vectorless@localhost:5432/vectorless?sslmode=disable), uses local
+# file storage and the Postgres-backed river queue, and requires no API key
+# to call the engine. This matches the all-in-one Docker image, where
+# Postgres is bundled in the same container. You still supply an LLM
+# provider key (e.g. VLE_LLM_ANTHROPIC_API_KEY) for ingestion + retrieval.
+# Override any local default with the usual env/flags, e.g.
+# VLE_SERVER_ADDR=:9000 or VLE_STORAGE_LOCAL_ROOT=/data/documents.
+# Local mode is for dev/local use — do NOT expose it to the public internet.
+
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 120s
+
+  # TLS is OPT-IN. Leave both files empty to serve plaintext HTTP behind a
+  # reverse proxy (Caddy, nginx, an ALB, ingress) — the recommended
+  # production setup because cert rotation stays in the proxy. Set both
+  # cert_file and key_file to have the engine terminate TLS directly
+  # (useful for single-node / homelab / MCP-over-public-internet).
+  tls:
+    cert_file: ""            # path to PEM cert chain
+    key_file: ""             # path to PEM private key
+    min_version: "1.2"       # "1.2" | "1.3"
+
+database:
+  # Postgres connection used for documents, sections (the tree), and (if
+  # queue.driver=river) the job queue.
+  url: "postgres://vectorless:vectorless@localhost:5432/vectorless?sslmode=disable"
+  max_conns: 10
+
+storage:
+  # Where document bytes are stored.
+  # driver: local | s3
+  driver: "local"
+
+  local:
+    root: "./data/documents"
+
+  s3:
+    # Works for AWS S3, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces,
+    # and any other S3-compatible provider — just point endpoint at their URL.
+    endpoint: "http://localhost:9000"
+    region: "us-east-1"
+    bucket: "vectorless-docs"
+    access_key: "minio"
+    secret_key: "miniominio"
+    use_path_style: true     # true for MinIO / R2 / most non-AWS providers
+
+queue:
+  # Where background jobs (ingest, tree-build, summarize) are scheduled.
+  # driver: qstash | river | asynq
+  driver: "river"
+
+  qstash:
+    # Upstash QStash — ideal for serverless hosts (Vercel, Cloudflare Workers).
+    token: ""
+    webhook_base_url: "https://your-engine.example.com"
+
+  river:
+    # Postgres-backed, uses database.url above. No extra infra needed.
+    num_workers: 10
+
+  asynq:
+    # Redis-backed. Higher throughput when Redis is already available.
+    addr: "localhost:6379"
+    password: ""
+    db: 0
+    concurrency: 20
+
+llm:
+  # Provider used for tree construction and retrieval reasoning.
+  # driver: anthropic | openai | gemini
+  driver: "anthropic"
+
+  anthropic:
+    api_key: ""
+    model: "claude-sonnet-4-5"
+    reasoning_model: "claude-opus-4-5"   # optional override for deep-reason strategy
+
+  openai:
+    api_key: ""
+    model: "gpt-4o-mini"
+    reasoning_model: "gpt-4o"
+
+  gemini:
+    api_key: ""
+    model: "gemini-2.0-flash"
+    reasoning_model: "gemini-2.5-pro"
+
+  # Concurrency: one adaptive limiter per provider (chat model, Judge).
+  # The limit starts at initial and moves — halved on a 429 or transport
+  # failure (honouring Retry-After), widened by one after a run of
+  # successes, never above max — so the provider's real capacity sets
+  # the pace, not a guess. Every change is logged.
+  concurrency:
+    initial: 4
+    max: 64
+
+  # Judge: a System One model (TypeSafe Jev) that answers the ingest
+  # pipeline's judgements — contents-page detection and page resolution —
+  # in one batched request per document instead of a generative call per
+  # page. Enabled exactly when an api_key is present; also read from
+  # VLE_TYPESAFE_API_KEY or TYPESAFE_API_KEY. Without it, long filings
+  # lose every leaf's page (HAL-1367) and the TOC stage runs minutes
+  # slower on the driver above.
+  judge:
+    typesafe:
+      api_key: ""
+      # base_url: ""     # override the endpoint; empty = api.typesafe.ai
+      # model: ""        # override the model alias
+    # threshold: 0.5     # Noul probability that counts as "yes"
+
+retrieval:
+  # strategy: single-pass | chunked-tree | agentic | treewalk
+  #
+  #   single-pass:  whole tree in one LLM call; fastest, smallest docs.
+  #   chunked-tree: split the tree, reason over slices in parallel, merge.
+  #                 The default. Scales to any tree size by trading
+  #                 context for parallelism.
+  #   agentic:      iterative outline → expand → read → done loop.
+  #                 Picks per-section IDs via a tool-using model.
+  #   treewalk:    TreeWalk-style page-based agentic loop. Three
+  #                 tools (get_document_structure / get_pages / done);
+  #                 the model navigates by INCLUSIVE PAGE RANGE
+  #                 rather than by section ID. Best for paginated
+  #                 documents (SEC filings, academic PDFs) where the
+  #                 per-section interface is too noisy.
+  strategy: "chunked-tree"
+
+  chunked_tree:
+    # Max tokens of tree view to feed a single LLM call (per subtree slice).
+    max_tokens_per_call: 60000
+    # Max parallel LLM calls when the tree must be split.
+    max_parallel_calls: 8
+    # If true, include summary-only breadcrumbs of sibling subtrees each call
+    # doesn't own, so the model knows what else exists in the document.
+    include_sibling_breadcrumbs: true
+
+  # answer_span: when enabled, every section returned by /v1/query gets an
+  # extra `answer_span` field carrying the verbatim quote the model judged
+  # most relevant to the query, plus byte offsets back into the section's
+  # content. Costs one LLM call per returned section. Opt-in by default.
+  answer_span:
+    enabled: false
+    # Override the model used for span extraction; empty inherits the
+    # request's model. Keep this on a cheap/fast model — the call is
+    # short and runs once per returned section.
+    model: ""
+    max_concurrency: 4
+    max_quote_len: 400
+
+  # answer: /v1/answer endpoint configuration. The endpoint runs
+  # retrieval + per-section span extraction + a synthesis LLM call,
+  # returning {answer, citations:[{section_id, page_start, page_end, quote}]}.
+  answer:
+    # Override the synthesis-call model; empty inherits the request's model.
+    model: ""
+    max_sections: 5
+    max_answer_tokens: 1024
+
+  # planning: Phase 2.1 query planning + Phase 2.2 multi-hop decomposition.
+  # When enabled, every /v1/query and /v1/answer request first issues a
+  # short LLM call that returns a structured Plan (intent, entities,
+  # expected document areas, multi-hop flag, sub-questions). Multi-hop
+  # plans fan retrieval out one selection call per sub-question and
+  # union the results.
+  #
+  # OPT-IN. Default disabled. Per-request `enable_planning` body field
+  # overrides this block, so callers can experiment without a restart.
+  # Plans are cached in a per-process LRU keyed on (query, model);
+  # repeated questions don't burn extra LLM budget.
+  planning:
+    enabled: false
+    # Override the planner's model; empty inherits the engine's
+    # configured default. Point this at a small/fast model — planning
+    # is a short prompt that shouldn't run on the flagship model.
+    model: ""
+    cache_size: 128
+    # decompose: when planning runs, multi-hop plans fan retrieval
+    # out per sub-question. Set false to validate the planner in
+    # isolation (plan returned, but retrieval uses the original query).
+    decompose: true
+
+  # rerank: Phase 2.3 content-aware re-rank pass. After the retrieval
+  # strategy returns candidate sections and their content is loaded,
+  # one extra LLM call scores each section (0-100) against the query
+  # and the engine reorders descending by score.
+  #
+  # This is the safety net for the case where the strategy reasoned
+  # over title + summary + HyDE candidate questions and got fooled
+  # by surface-level matches. Reading the actual content closes that
+  # gap. ~3-5k input tokens per query on gemini-2.5-flash; ~$0.0003
+  # per call at typical rates.
+  #
+  # OPT-IN. Default disabled. Per-request `enable_rerank` body field
+  # overrides this block. Failures never drop sections — at worst the
+  # strategy's order is preserved.
+  rerank:
+    enabled: false
+    # Override the re-rank model; empty inherits the request's model
+    # (or the engine default). Keep this on a small/fast model — the
+    # re-rank prompt is short and shouldn't burn the flagship model.
+    model: ""
+    # Per-candidate content budget. Higher = more context for the
+    # model to judge with, lower = tighter cost. 2000 chars ≈ 500
+    # tokens, comfortable for typical section sizes.
+    max_content_chars: 2000
+    # Truncate the post-rerank candidate list to the top K. 0 means
+    # keep all candidates (re-rank only reorders). Useful when the
+    # strategy returns a wide candidate list and you want the
+    # re-rank pass to do the final selection.
+    top_k: 0
+
+  # abstain: Phase 2.4 abstention. When the selection LLM returns
+  # per-pick confidence scores (the new picks shape) and every
+  # confidence falls below `below`, /v1/query and /v1/answer skip the
+  # normal path and return an abstention response instead:
+  #   {abstained: true, abstention_reason: "...", sections: [],
+  #    min_confidence_threshold: 0.4, candidate_confidences: {...}}
+  # For /v1/answer the synthesis call is skipped entirely; the answer
+  # is the honest "I cannot answer this question from the supplied
+  # document." This trades a likely hallucination for a clear refusal
+  # when the engine's own confidence is weak.
+  #
+  # OPT-OUT. Default enabled. Per-request `enable_abstain` body field
+  # overrides this block. When the selection LLM returns the legacy
+  # shape (no confidence scores) the engine never abstains regardless
+  # of this setting — abstention requires explicit confidence signal.
+  #
+  # The check is "all picks below threshold". If any pick scored
+  # above, the engine surfaces that section as evidence — abstention
+  # is reserved for the case where every candidate is weak.
+  abstain:
+    enabled: true
+    # Confidence threshold in [0.0, 1.0]. Picks with confidence
+    # strictly less than this are "not confident"; when ALL picks
+    # fall below, the response is an abstention. 0.4 is the default
+    # — high enough to filter weak matches, low enough not to
+    # suppress legitimate partial answers.
+    below: 0.4
+
+  # replay: Phase 3.1 reproducibility store. Every /v1/query and
+  # /v1/answer response carries a deterministic `trace_token`; the
+  # response body is stored in an in-memory LRU under that token so
+  # POST /v1/replay can return the byte-identical response on demand.
+  #
+  # OPT-OUT. Default enabled — replay is a moat versus stateless
+  # vector RAG and should ship on by default. Disable to free the
+  # memory budget when audit/replay isn't part of the operator's
+  # flow. When disabled the response `trace_token` field is empty
+  # and /v1/replay returns 501.
+  #
+  # The store is in-memory and not durable across process restarts.
+  # Phase 3.2 will swap this for a persistent store + per-document
+  # versioning behind the same interface.
+  replay:
+    enabled: true
+    # LRU capacity. Older entries are evicted under memory pressure.
+    max_entries: 1024
+    # How long an entry remains valid. 86400 = 24 hours. Long
+    # audit flows may bump this; tight memory budgets shrink it.
+    ttl_seconds: 86400
+
+  # treewalk: TreeWalk-style page-based agentic strategy and its
+  # dedicated POST /v1/answer/treewalk endpoint.
+  #
+  # The strategy runs a three-tool loop:
+  #   1. get_document_structure() — returns the TOC tree (titles +
+  #      page ranges, no body text).
+  #   2. get_pages(start_page, end_page) — returns the concatenated
+  #      content of every section whose page range overlaps.
+  #   3. done(answer, cited_pages, reasoning) — terminates with the
+  #      natural-language answer plus the cited inclusive ranges.
+  #
+  # Unlike /v1/answer there's no separate synthesis call — the
+  # model emits the final answer inside the done tool call. The
+  # response carries per-page-range citations with answer-span
+  # quotes, a deterministic trace_token (replayable via
+  # /v1/replay), and an optional reasoning_trace describing every
+  # tool call. Streaming via SSE is available with `stream:true`
+  # on the request body — one event per tool call so callers
+  # watch the navigation in real time.
+  #
+  # OPT-OUT. Default enabled. Disable to unwire the endpoint
+  # (returns 501); the strategy itself can still be selected by
+  # setting `retrieval.strategy: treewalk` even when this block
+  # is disabled.
+  #
+  # Works WITHOUT a persisted TOC tree (pre-PR-A state) — the
+  # strategy synthesises a TOC view from the section list when
+  # documents.toc_tree is NULL. No request fails because of a
+  # missing TOC.
+  treewalk:
+    enabled: true
+    # Cap on LLM turns per request, including the terminal done
+    # turn. The reference TreeWalk demo converges in 3-5 hops on
+    # typical questions; 8 leaves buffer for retries on parse
+    # failures and the occasional extra get_pages call.
+    max_hops: 8
+    # Cap on chars one get_pages tool call returns. 16,000 ≈ 4K
+    # tokens — enough for a 5-7 page excerpt, well under any
+    # flagship model's context window. Higher values risk burning
+    # context budget on stray full-document fetches.
+    page_content_limit: 16000
+    # Cap on how many distinct page ranges the FINAL answer may
+    # cite. A confidence backstop, not a navigation limit: the
+    # model may read as many pages as max_hops allows, but the
+    # citation set it commits to is bounded. FinanceBench data
+    # shows the failure mode is "spray ~5 low-confidence ranges ->
+    # miss all" while a single confident pick scores perfectly;
+    # capping the final set tames the spray. 3 keeps a genuinely
+    # multi-location answer (e.g. a figure + its footnote) while
+    # cutting the low-confidence tail. Env: VLE_/VLS_RETRIEVAL_TREEWALK_MAX_CITATIONS.
+    max_citations: 3
+    # Override the navigation-loop model; empty inherits the
+    # request's model (which itself falls back to the engine
+    # default). Most deployments leave this blank — navigation
+    # and answer happen in the same loop, so a "small model for
+    # navigation, large for answer" split doesn't apply.
+    model: ""
+
+ingest:
+  # Ingest mode — how much work the pipeline does before a document is
+  # marked `ready` (queryable).
+  #
+  #   full     (default) parse -> build tree -> persist -> summarize ->
+  #            HyDE -> multi-axis summaries -> TOC build. Maximises
+  #            retrieval quality but costs ~1,000-3,000 LLM calls plus a
+  #            pdftable table-finding pass on a large filing — minutes of
+  #            wall time for a 90-page 10-K.
+  #
+  #   minimal  parse -> build tree -> persist -> ready. Skips ALL
+  #            per-section LLM enrichment (summarize, HyDE, multi-axis,
+  #            TOC build) AND the pdftable table-extraction pass, so a
+  #            document becomes queryable in ~parse-speed (seconds).
+  #            The page-based strategy (/v1/answer/treewalk) needs none
+  #            of the skipped work: it navigates a TOC synthesised from
+  #            the section tree (documents.toc_tree is left NULL) and
+  #            reads raw section/page text at query time — and that raw
+  #            page text still contains the tables' text, so dropping
+  #            table *sections* loses nothing for it. The
+  #            summary-dependent strategies (chunked-tree, agentic)
+  #            degrade to titles + raw content with no summaries.
+  #
+  #   toc      parse -> build tree -> table of contents -> persist ->
+  #            ready. The page-based pipeline and nothing else: on a
+  #            Judge the TOC stage is three requests and seconds, and
+  #            page-based retrieval (treewalk, judgewalk) needs none of
+  #            the per-section enrichment. Table extraction skipped as
+  #            in minimal. The mode the FinanceBench evaluations use.
+  #
+  # Override per-process with VLE_INGEST_MODE; on the deployed
+  # vectorless-server use VLS_INGEST_MODE=minimal (no secret edit needed).
+  mode: "full"
+
+  # Total-parse timeout (seconds). Bounds the ENTIRE parse of one
+  # document end to end — row extraction, table extraction, section
+  # building, and the leaf-section cap. It is the outermost robustness
+  # valve: a pathological/malformed PDF (observed: a 10-K stuck 600s+ in
+  # `parsing`, even in minimal mode, inside pure-Go row extraction) is
+  # abandoned at the deadline and the document fails fast instead of
+  # wedging the pipeline forever. NOTHING is disabled by this bound — the
+  # full feature set (LLM TOC, tables, summarize, HyDE, multi-axis) still
+  # runs; parse is merely time-boxed. Applies in BOTH full and minimal
+  # mode (parse runs in both).
+  #
+  # 120 is comfortably longer than a healthy 300-page filing's parse
+  # (seconds to low tens of seconds) yet short enough to reap a hang
+  # quickly. 0 uses the engine default (120). Override per-process with
+  # VLE_INGEST_PARSE_TIMEOUT_SECONDS; the deployed server also honours
+  # VLS_INGEST_PARSE_TIMEOUT_SECONDS.
+  parse_timeout_seconds: 120
+
+  # Cap on the number of leaf sections one document may produce. A
+  # pathological PDF (e.g. a 90-page 10-K whose every bold statement
+  # title trips the heading detector, or a heading→one-body-leaf chain
+  # repeated hundreds of times) can shatter into far more leaves than the
+  # document has real sections — each leaf then costs a summarize + HyDE
+  # + multi-axis LLM call, which is what throttles/stalls full ingest.
+  # When the parsed leaf count exceeds this cap the parser merges
+  # sections (smallest first; single-leaf parents collapse into their
+  # parent) until the document is back under the cap, preserving content
+  # and never merging table sections. 400 sits comfortably above a real
+  # filing's section count while still catching the runaway case. 0 uses
+  # the engine default (400); a negative value disables the cap. Override
+  # with VLE_INGEST_MAX_SECTIONS.
+  max_sections: 400
+
+  # The summarize and HyDE stages run concurrently. This caps the total
+  # number of LLM calls in flight across both stages combined, so the
+  # provider's per-tenant concurrency limit isn't exceeded. 0 disables
+  # the global cap; default applied by the engine is 12.
+  # (Ignored when mode: minimal — no LLM stages run.)
+  global_llm_concurrency: 12
+
+  # HyDE candidate-question stage. For each leaf section the pipeline asks
+  # the LLM to enumerate questions the section answers; those are folded
+  # into the retrieval prompt at query time to widen recall on queries
+  # that don't echo the section's exact wording.
+  hyde:
+    enabled: true
+    # Override the LLM model used for HyDE; empty inherits the summary model.
+    model: ""
+    num_questions: 5
+    concurrency: 4
+
+  # Tables: pdftable-driven extraction. Every detected table on a PDF
+  # page becomes its own Section with `Metadata["table"]="true"`, content
+  # rendered as GitHub-flavoured Markdown. This is the single biggest
+  # retrieval-quality lever on documents where numeric answers live in
+  # balance sheets — text-only extraction collapses tables into a
+  # space-joined run that's effectively unsearchable.
+  #
+  # ENABLED BY DEFAULT. Flip to false if a pathological PDF surfaces a
+  # regression — table-extraction errors never break ingest (text-only
+  # output still ships), but the flag is the kill switch.
+  tables:
+    enabled: true
+    # Vertical / horizontal edge-detection strategy. One of:
+    #   lines        (default) — edges from drawn lines/rects/curves
+    #   lines_strict             edges from drawn lines only
+    #   text                     edges inferred from word alignment
+    #                            (best for borderless / narrative tables)
+    #   explicit                 caller-supplied coordinates (reserved)
+    # The two axes mix independently, so "lines" vertical + "text"
+    # horizontal works for half-ruled tables.
+    vertical_strategy: "lines"
+    horizontal_strategy: "lines"
+    # Drop candidate tables smaller than this. 2x2 is the floor — a
+    # single row or column is a list or a header, not a table.
+    min_table_rows: 2
+    min_table_cols: 2
+
+  # Multi-axis structured summaries (Phase 2.5). When enabled, the
+  # summarize stage runs in JSON mode and produces {topics, entities,
+  # numbers, one_line} per section instead of a single sentence. The
+  # structured blob lives in sections.summary_axes; the one_line still
+  # populates sections.summary so older API consumers keep working
+  # unchanged. The retrieval prompt surfaces entities + numbers from
+  # the axes block on the section line so the model has direct
+  # surface-form access to proper-noun and numeric anchors.
+  #
+  # ENABLED BY DEFAULT. Flip to false to roll back to the pre-2.5
+  # single-sentence path without redeploying the binary.
+  summary_axes:
+    enabled: true
+    # Per-axis caps prevent a misbehaving model from blowing up the
+    # retrieval prompt budget. Values below are the defaults; tune
+    # only if the model returns systematically truncated output.
+    max_topics: 4
+    max_entities: 8
+    max_numbers: 6
+
+  # LLM-built table-of-contents tree (TreeWalk-style). Runs after
+  # summarize+HyDE on PDF inputs and persists a hierarchical TOC on
+  # documents.toc_tree (JSONB). The tree is small (a few KB even
+  # for 300-page filings) and is intended as a higher-level map
+  # retrieval strategies can reason over before drilling into the
+  # parser-derived sections tree.
+  #
+  # ENABLED BY DEFAULT for PDFs. Non-PDF documents skip the stage
+  # unconditionally. Builder failures are non-fatal — the document
+  # remains fully retrievable via the existing sections tree.
+  toc:
+    enabled: true
+    # Override the LLM model used by the builder; empty inherits
+    # the summary model. Point this at a reasoning-capable model —
+    # the no-TOC generator has to find hierarchy in raw body text,
+    # which a small/fast model often botches.
+    model: ""
+    # Cap on parallel LLM calls during the verification phase
+    # (one call per leaf node).
+    concurrency: 4
+    # The detector scans the first N pages for a table of
+    # contents. TreeWalk defaults this to 20 — financial filings
+    # put their TOC inside the first dozen pages and a document
+    # without one by page 20 almost never has one further in.
+    toc_check_pages: 20
+
+log:
+  level: "info"            # debug | info | warn | error
+  format: "json"           # json | console
