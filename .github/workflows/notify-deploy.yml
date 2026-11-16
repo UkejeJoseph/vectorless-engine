@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger deploy
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
           repository: hallelx2/vectorless-deploy
